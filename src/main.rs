@@ -11,13 +11,15 @@ mod config;
 mod events;
 mod executor;
 mod fair_value;
+mod hyperliquid;
+mod hyperliquid_sign;
 mod inventory;
 mod key;
 mod market_maker;
 mod strategy;
 mod telemetry;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use bullet_rust_sdk::Keypair;
@@ -40,12 +42,15 @@ enum Command {
         #[arg(default_value = "bot.toml")]
         config: PathBuf,
     },
-    /// Make a new trading key for the bot, to delegate to in the Bullet app.
+    /// Make a new trading key for the bot, to approve in the exchange's app.
     Keygen {
-        #[arg(default_value = "bot.key")]
-        path: PathBuf,
+        /// Where to write it (default: bot.key for Bullet, hyperliquid.key for Hyperliquid).
+        path: Option<PathBuf>,
         #[arg(long, default_value = "mainnet")]
         network: String,
+        /// Which exchange the key is for.
+        #[arg(long, default_value = "bullet", value_parser = ["bullet", "hyperliquid"])]
+        venue: String,
     },
 }
 
@@ -64,22 +69,25 @@ async fn main() -> Result<()> {
         config: "bot.toml".into(),
     }) {
         Command::Run { config } => bot::run(&config, cli.live).await,
-        Command::Keygen { path, network } => keygen(&path, &network),
+        Command::Keygen {
+            path,
+            network,
+            venue,
+        } => {
+            if venue == "hyperliquid" {
+                keygen_hyperliquid(&path.unwrap_or("hyperliquid.key".into()), &network)
+            } else {
+                keygen(&path.unwrap_or("bot.key".into()), &network)
+            }
+        }
     }
 }
 
 fn keygen(path: &PathBuf, network: &str) -> Result<()> {
-    if path.exists() {
-        bail!("{} already exists; not overwriting a key", path.display());
-    }
+    refuse_to_overwrite(path)?;
     let keypair = Keypair::generate();
     keypair.write_to_file(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Only you can read it.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    only_you_can_read(path)?;
     let address = keypair.address();
     println!(
         "Wrote a new key to {}. Keep it secret; never commit it.\n",
@@ -88,5 +96,44 @@ fn keygen(path: &PathBuf, network: &str) -> Result<()> {
     println!("Its address: {address}\n");
     println!("Next: open this link (logged in to Bullet) and click Confirm Delegation:");
     println!("  {}", bullet::delegate_link(network, &address));
+    Ok(())
+}
+
+/// Hyperliquid keys are Ethereum-style, so they're made differently. You
+/// approve this one as an "API wallet": it can trade but can't withdraw.
+fn keygen_hyperliquid(path: &Path, network: &str) -> Result<()> {
+    refuse_to_overwrite(path)?;
+    let wallet = hyperliquid_sign::Wallet::generate();
+    std::fs::write(path, wallet.secret_hex() + "\n")?;
+    only_you_can_read(path)?;
+    println!(
+        "Wrote a new key to {}. Keep it secret; never commit it.\n",
+        path.display()
+    );
+    println!("Its address: {}\n", wallet.address());
+    let app = if network == "testnet" {
+        "https://app.hyperliquid-testnet.xyz/API"
+    } else {
+        "https://app.hyperliquid.xyz/API"
+    };
+    println!("Next: open {app} (wallet connected), paste that address as the API wallet,");
+    println!("name it hft-for-dummies, and click Authorize.");
+    Ok(())
+}
+
+fn refuse_to_overwrite(path: &Path) -> Result<()> {
+    if path.exists() {
+        bail!("{} already exists; not overwriting a key", path.display());
+    }
+    Ok(())
+}
+
+fn only_you_can_read(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let _ = path; // nothing to do elsewhere
     Ok(())
 }

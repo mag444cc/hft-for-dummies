@@ -17,15 +17,15 @@ use crate::config::Config;
 use crate::events::{Event, Fill, Intent, Order, Side};
 use crate::fair_value::{FairValue, NotReady};
 use crate::inventory::Inventory;
-use crate::strategy::{self, Quotes};
+use crate::strategy::{self, Quotes, Ticks};
 
 /// How often to check our fills against the exchange's record.
 const FILL_CHECK_EVERY: Duration = Duration::from_secs(10);
 
 pub struct MarketMaker {
     config: Config,
-    /// Bullet's price increment for this market.
-    tick: Decimal,
+    /// Which prices the exchange accepts on this market.
+    ticks: Ticks,
     fair: FairValue,
     book: Option<(Book, Instant)>,
     bid: Option<Order>,
@@ -45,14 +45,14 @@ pub struct MarketMaker {
 }
 
 impl MarketMaker {
-    pub fn new(config: Config, tick: Decimal) -> Self {
+    pub fn new(config: Config, ticks: Ticks) -> Self {
         // Start ids from the clock so they never repeat across restarts.
         let next_client_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(1, |d| d.as_millis() as u64 * 1000);
         Self {
             config,
-            tick,
+            ticks,
             fair: FairValue::default(),
             book: None,
             bid: None,
@@ -131,7 +131,7 @@ impl MarketMaker {
             }
             Event::Reconnecting => {
                 // We may have missed fills or cancels: pull everything, catch up on fills.
-                tracing::warn!("Bullet reconnecting: pulling quotes and checking our fills");
+                tracing::warn!("exchange reconnecting: pulling quotes and checking our fills");
                 self.book = None;
                 let mut intents = self.pull();
                 intents.push(Intent::SyncFills);
@@ -231,21 +231,27 @@ impl MarketMaker {
             return (none, why);
         }
         let Some((book, at)) = &self.book else {
-            return (none, "waiting for the Bullet order book");
+            return (none, "waiting for the order book");
         };
         if now.duration_since(*at) > Duration::from_secs(self.config.book_stale_secs) {
-            return (none, "Bullet order book is stale, not quoting");
+            return (none, "order book is stale, not quoting");
         }
         match self.fair.get(now, self.reference_stale()) {
             Ok(fair) => (
-                strategy::quote(fair, self.inventory.position, &self.config, book, self.tick),
+                strategy::quote(
+                    fair,
+                    self.inventory.position,
+                    &self.config,
+                    book,
+                    self.ticks,
+                ),
                 "quoting",
             ),
             Err(NotReady::NoBinancePrice) => (none, "waiting for Binance"),
             Err(NotReady::BinanceStale) => (none, "Binance price is stale, not quoting"),
             Err(NotReady::WarmingUp) => (
                 none,
-                "learning the Binance-to-Bullet price gap (takes about a minute)",
+                "learning the price gap to Binance (takes about a minute)",
             ),
         }
     }
@@ -331,7 +337,7 @@ impl MarketMaker {
     pub fn log_summary(&self) {
         let fair = self.fair.get(Instant::now(), self.reference_stale()).ok();
         tracing::info!(
-            "bullet mid {} | fair {} | our bid {} ask {} | position {} | pnl ${} (fees ${})",
+            "mid {} | fair {} | our bid {} ask {} | position {} | pnl ${} (fees ${})",
             show(self.mid()),
             show(fair.map(|f| f.round_dp(4))),
             show(self.bid.map(|o| o.price)),
@@ -378,7 +384,7 @@ mod tests {
         config.max_position = d("2");
         config.requote_threshold_bps = d("5");
         config.min_requote_ms = 0;
-        let mut mm = MarketMaker::new(config, d("0.01"));
+        let mut mm = MarketMaker::new(config, Ticks::Fixed(d("0.01")));
         let start = Instant::now();
         let book = Book::from_levels(&[(d("99.5"), d("10"))], &[(d("100.5"), d("10"))]);
         for s in 0..=WARMUP.as_secs() {

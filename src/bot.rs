@@ -1,8 +1,8 @@
 //! The harness: wires the pieces together and runs the loop.
 //!
 //! ```text
-//!  Binance feed ──┐                                  ┌── LiveExecutor ──> Bullet
-//!  Bullet feed ───┼──> bus ──> MarketMaker ──> intents
+//!  Binance feed ──┐                                  ┌── LiveExecutor ──> Bullet or Hyperliquid
+//!  exchange feed ─┼──> bus ──> MarketMaker ──> intents
 //!  timer, Ctrl-C ─┘     ^       (state machine)      └── PaperExecutor (dry run)
 //!                       └──────── fills, acks, failures ──────┘
 //! ```
@@ -17,22 +17,24 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::config::Config;
+use crate::config::{Config, VenueName};
 use crate::events::{Bus, Event, Intent, Stamp};
-use crate::executor::{Executor, LiveExecutor, PaperExecutor};
+use crate::executor::{Executor, LiveExecutor, PaperExecutor, Venue};
 use crate::market_maker::MarketMaker;
+use crate::strategy::Ticks;
 use crate::telemetry::{self, Telemetry};
-use crate::{binance, bullet};
+use crate::{binance, bullet, hyperliquid};
 
 pub async fn run(config_path: &Path, live: bool) -> Result<()> {
     let config = Config::load(config_path)?.live(live);
+    let venue = format!("{:?}", config.venue).to_lowercase();
     if config.dry_run {
         tracing::info!(
-            "DRY RUN: watching {} and logging the quotes we would place. No orders are sent.",
+            "DRY RUN: watching {} on {venue} and logging the quotes we would place. No orders are sent.",
             config.symbol
         );
     } else {
-        tracing::warn!("LIVE: trading {} with real money", config.symbol);
+        tracing::warn!("LIVE: trading {} on {venue} with real money", config.symbol);
     }
 
     // Metrics are a window, not a dependency: if the port is taken, run without.
@@ -43,19 +45,40 @@ pub async fn run(config_path: &Path, live: bool) -> Result<()> {
     }
 
     let (bus, events) = mpsc::unbounded_channel();
-    // Bullet first: it takes a second to connect, and Binance ticks queued
-    // meanwhile would show up as fake queueing delay.
-    let bullet = bullet::connect(&config, bus.clone()).await?;
+    // The exchange first: it takes a second to connect, and Binance ticks
+    // queued meanwhile would show up as fake queueing delay.
+    match config.venue {
+        VenueName::Bullet => {
+            let bullet = bullet::connect(&config, bus.clone()).await?;
+            let ticks = Ticks::Fixed(bullet.tick);
+            trade(config, bullet, ticks, bus, events).await
+        }
+        VenueName::Hyperliquid => {
+            let hyperliquid = hyperliquid::connect(&config, bus.clone()).await?;
+            let ticks = hyperliquid.ticks;
+            trade(config, hyperliquid, ticks, bus, events).await
+        }
+    }
+}
+
+/// Everything after connecting is the same on every exchange.
+async fn trade(
+    config: Config,
+    venue: impl Venue,
+    ticks: Ticks,
+    bus: Bus,
+    events: mpsc::UnboundedReceiver<Event>,
+) -> Result<()> {
     binance::connect(&config.binance_symbol, bus.clone());
     spawn_timer(bus.clone());
     spawn_ctrl_c(bus.clone());
 
     let dry_run = config.dry_run;
-    let market_maker = MarketMaker::new(config, bullet.tick);
+    let market_maker = MarketMaker::new(config, ticks);
     if dry_run {
         event_loop(market_maker, PaperExecutor::new(bus), events).await
     } else {
-        event_loop(market_maker, LiveExecutor::new(bullet, bus), events).await
+        event_loop(market_maker, LiveExecutor::new(venue, bus), events).await
     }
 }
 

@@ -1,7 +1,8 @@
 # hft-for-dummies
 
 Companion code for the *HFT for dummies* blog series: a SOL-USD market maker on
-Bullet priced off Binance. Readers fork it and follow along part by part, many
+Bullet priced off Binance. It can also quote ETH and BTC, and trade on
+Hyperliquid (`configs/`). Readers fork it and follow along part by part, many
 of them new to Rust and to trading. `README.md` is the user-facing guide; this
 file is for agents.
 
@@ -20,13 +21,17 @@ appears.
 
 - **Going live is the user's call.** Don't run with `--live`, set
   `dry_run = false`, or push them towards it unless they've asked to trade
-  for real. Confirm the amount first. Go live with `cargo run -- --live`, not
-  by editing `bot.toml`: the file stays on dry run and every part's checkout
-  stays clean.
+  for real. Confirm the amount, exchange and market first. Go live with
+  `cargo run -- --live` (or `cargo run -- run configs/<name>.toml --live`),
+  not by editing a config: the files stay on dry run and every part's
+  checkout stays clean.
 - **Keys.** Never ask for a private key in the chat, and never print, `cat`,
   copy, or commit `bot.key`. Prefer `keygen` and hand the user the link to
   confirm: the secret never leaves their disk. If they bring their own key,
   they paste it into `bot.key` themselves. Addresses are public and fine.
+  The same goes for Hyperliquid's `hyperliquid.key`
+  (`cargo run -- keygen --venue hyperliquid`); the user approves its address
+  as an API wallet at https://app.hyperliquid.xyz/API.
 - **The Bullet app is the user's.** They create the account, deposit and
   approve delegates there. Ask for their account address so you can check
   things read-only (no key needed; `ADDR` the account, `KEY` the delegate's
@@ -42,8 +47,17 @@ appears.
   Full API docs (REST, WebSocket, order types, delegates), written for agents:
   https://tradingapi.bullet.xyz/docs/llms.txt
 
+  On Hyperliquid (`ADDR` the account, `KEY` the API wallet's address):
+
+  ```sh
+  H=https://api.hyperliquid.xyz/info; J='content-type: application/json'
+  curl -s $H -H "$J" -d '{"type":"userRole","user":"KEY"}'            # {"role":"agent","data":{"user":ADDR}} once approved
+  curl -s $H -H "$J" -d '{"type":"clearinghouseState","user":"ADDR"}' # balance, positions
+  curl -s $H -H "$J" -d '{"type":"openOrders","user":"ADDR"}'         # resting orders
+  ```
+
   Run these before a live start (warn if there's already a SOL-USD position or
-  orders) and after stopping (no orders should remain; any position is the
+  orders on that market) and after stopping (no orders should remain; any position is the
   user's to close or keep).
 - **Stopping.** Ctrl-C or SIGINT, so the bot cancels its orders. Never
   SIGKILL a live bot.
@@ -63,15 +77,17 @@ cargo fmt && cargo clippy --all-targets -- -D warnings   # before every commit (
 
 Event-driven, the same shape as the bullet-bots harness, kept small:
 
-- Feeds (`binance.rs`, `bullet.rs`) turn the outside world into `Event`s on one bus (`events.rs`).
+- Feeds (`binance.rs`, `bullet.rs`, `hyperliquid.rs`) turn the outside world into `Event`s on one bus (`events.rs`).
 - `MarketMaker` (`market_maker.rs`) is a pure state machine: `on_event` / `requote` return `Intent`s. No I/O, no awaits.
 - An `Executor` (`executor.rs`) carries intents out and reports results back as events. Live and paper implement the same trait.
+  The live one talks to an exchange through the `Venue` trait, which Bullet and Hyperliquid implement.
 - `bot.rs` only wires and runs the loop.
 
 Each series part should change one box and leave the others alone. When a part
 needs a new capability, add an event, intent, or executor, not a special case
-in the loop. Don't add generality no part needs yet (multiple venues or
-strategies, actor registries).
+in the loop. Don't add generality no part needs yet (several
+strategies, actor registries, several markets in one process: run one bot per
+market instead).
 
 ### Rules
 
@@ -84,7 +100,8 @@ strategies, actor registries).
 - `rust_decimal::Decimal` for every price, size and amount.
 - Position changes only from fills (`Inventory::on_fill`) or an exchange read (`adopt`), never from sending an order.
 - Money-safety code needs a test for every change: `market_maker.rs`, `strategy.rs`,
-  `inventory.rs`, `executor.rs`, `book.rs`, `fair_value.rs`, `key.rs`, and the config checks.
+  `inventory.rs`, `executor.rs`, `book.rs`, `fair_value.rs`, `key.rs`, `hyperliquid_sign.rs`,
+  the message parsing in `hyperliquid.rs`, and the config checks.
   Write the failing test first.
-- `bot.toml` must ship with `dry_run = true` (a test enforces it). Never commit keys (`*.key` is ignored).
+- `bot.toml` and every file in `configs/` must ship with `dry_run = true` (tests enforce it). Never commit keys (`*.key` is ignored).
 - Keep the README's setup steps and the section above in step with the code.

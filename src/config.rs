@@ -10,6 +10,9 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Where we trade: "bullet" (the default) or "hyperliquid".
+    #[serde(default)]
+    pub venue: VenueName,
     /// "mainnet" or "testnet".
     pub network: String,
     /// Talk to Bullet at this address instead of the network's public one,
@@ -21,7 +24,7 @@ pub struct Config {
     /// Key file made by `cargo run -- keygen`. Only needed when `dry_run = false`.
     pub key_file: PathBuf,
 
-    /// The Bullet market we quote, e.g. "SOL-USD".
+    /// The market we quote: on Bullet e.g. "SOL-USD", on Hyperliquid the coin, e.g. "SOL".
     pub symbol: String,
     /// The Binance USD-M perp we borrow the price from, e.g. "SOLUSDT".
     pub binance_symbol: String,
@@ -55,6 +58,15 @@ pub struct Config {
     /// (`infra/grafana`). Off when unset.
     #[serde(default)]
     pub metrics_port: Option<u16>,
+}
+
+/// The exchanges the bot can trade on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VenueName {
+    #[default]
+    Bullet,
+    Hyperliquid,
 }
 
 impl Config {
@@ -104,6 +116,13 @@ impl Config {
                 self.max_position
             );
         }
+        // Hyperliquid's dead man's switch can't be set less than 5s ahead.
+        if self.venue == VenueName::Hyperliquid && self.quote_ttl_secs < 10 {
+            bail!(
+                "quote_ttl_secs must be at least 10 on Hyperliquid, got {}",
+                self.quote_ttl_secs
+            );
+        }
         Ok(())
     }
 }
@@ -143,6 +162,66 @@ mod tests {
     fn rejects_an_order_bigger_than_the_position_limit() {
         let mut config = Config::load(Path::new("bot.toml")).unwrap();
         config.order_size = config.max_position + Decimal::ONE;
+        assert!(config.validate().is_err());
+    }
+
+    /// Every config in `configs/`, by path.
+    fn shipped_configs() -> Vec<std::path::PathBuf> {
+        let mut paths: Vec<_> = std::fs::read_dir("configs")
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn every_shipped_config_is_valid_and_safe() {
+        let paths = shipped_configs();
+        assert!(paths.len() >= 5, "{paths:?}");
+        for path in paths {
+            let config =
+                Config::load(&path).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+            assert!(config.dry_run, "{} must ship on dry run", path.display());
+        }
+    }
+
+    #[test]
+    fn several_bots_can_run_at_once() {
+        let mut ports = vec![Config::load(Path::new("bot.toml")).unwrap().metrics_port];
+        for path in shipped_configs() {
+            ports.push(Config::load(&path).unwrap().metrics_port);
+        }
+        let count = ports.len();
+        ports.sort();
+        ports.dedup();
+        assert_eq!(ports.len(), count, "each config needs its own metrics port");
+    }
+
+    #[test]
+    fn hyperliquid_names_markets_by_coin() {
+        for path in shipped_configs() {
+            let config = Config::load(&path).unwrap();
+            if config.venue == VenueName::Hyperliquid {
+                assert!(!config.symbol.contains('-'), "{}", path.display());
+                assert_eq!(config.binance_symbol, format!("{}USDT", config.symbol));
+            }
+        }
+    }
+
+    #[test]
+    fn bullet_is_the_default_venue() {
+        assert_eq!(
+            Config::load(Path::new("bot.toml")).unwrap().venue,
+            VenueName::Bullet
+        );
+    }
+
+    #[test]
+    fn hyperliquid_needs_room_for_its_dead_mans_switch() {
+        let mut config = Config::load(Path::new("configs/hyperliquid-sol.toml")).unwrap();
+        config.quote_ttl_secs = 5;
         assert!(config.validate().is_err());
     }
 }
