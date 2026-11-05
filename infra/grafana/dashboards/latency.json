@@ -76,7 +76,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(hft_trip_seconds_sum{step=\"order-to-live (send + route + Bullet)\"}[5m]) / rate(hft_trip_seconds_count{step=\"order-to-live (send + route + Bullet)\"}[5m]) >= 0",
+          "expr": "rate(hft_trip_seconds_sum{step=\"order-to-live (send + route + exchange)\"}[5m]) / rate(hft_trip_seconds_count{step=\"order-to-live (send + route + exchange)\"}[5m]) >= 0",
           "legendFormat": "5 order-to-live",
           "refId": "5 order-to-l"
         }
@@ -222,8 +222,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "hft_hop_seconds{hop=\"order-to-live (send + route + Bullet)\",quantile=\"0.5\"} > 0",
-          "legendFormat": "5 order-to-live (send + route + Bullet)",
+          "expr": "hft_hop_seconds{hop=\"order-to-live (send + route + exchange)\",quantile=\"0.5\"} > 0",
+          "legendFormat": "5 order-to-live (send + route + exchange)",
           "refId": "5 order-to-live (rou"
         }
       ],
@@ -294,7 +294,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "hft_hop_seconds{hop=\"order-to-live (send + route + Bullet)\",quantile=\"0.5\"} > 0",
+          "expr": "hft_hop_seconds{hop=\"order-to-live (send + route + exchange)\",quantile=\"0.5\"} > 0",
           "legendFormat": "order-to-live p50",
           "refId": "order-to-live_p50"
         },
@@ -303,7 +303,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "hft_hop_seconds{hop=\"order-to-live (send + route + Bullet)\",quantile=\"0.99\"} > 0",
+          "expr": "hft_hop_seconds{hop=\"order-to-live (send + route + exchange)\",quantile=\"0.99\"} > 0",
           "legendFormat": "order-to-live p99",
           "refId": "order-to-live_p99"
         }

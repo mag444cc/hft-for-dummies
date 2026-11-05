@@ -1,5 +1,5 @@
 //! Telemetry: how long each hop of the loop takes, from a Binance update to
-//! our order resting on Bullet.
+//! our order resting on the exchange (Bullet or Hyperliquid).
 //!
 //! You can't speed up what you haven't measured. Every market event carries a
 //! [`Stamp`] (when the exchange says it happened, when we received it), and the
@@ -39,7 +39,7 @@ pub const QUEUE: &str = "queue (received → handled)";
 pub const TICK_TO_TRADE: &str = "tick-to-trade (our code)";
 /// From that decision until Bullet's matching engine opens the order (its own
 /// timestamp): sending it, the route there and Bullet's processing.
-pub const ORDER_TO_LIVE: &str = "order-to-live (send + route + Bullet)";
+pub const ORDER_TO_LIVE: &str = "order-to-live (send + route + exchange)";
 const TRIP: [&str; 5] = [
     BINANCE_MATCH_TO_SEND,
     BINANCE_NETWORK,
@@ -50,10 +50,10 @@ const TRIP: [&str; 5] = [
 
 // Also measured, overlapping the trip or off it.
 pub const DECIDE: &str = "decide (every requote)";
-pub const SUBMIT_PLACE: &str = "Bullet's reply to a place (round trip)";
-pub const SUBMIT_CANCEL: &str = "Bullet's reply to a cancel (round trip)";
-pub const SUBMIT_REPLACE: &str = "Bullet's reply to a replace (round trip)";
-pub const BULLET_NETWORK: &str = "Bullet book → us (network)";
+pub const SUBMIT_PLACE: &str = "exchange's reply to a place (round trip)";
+pub const SUBMIT_CANCEL: &str = "exchange's reply to a cancel (round trip)";
+pub const SUBMIT_REPLACE: &str = "exchange's reply to a replace (round trip)";
+pub const BOOK_NETWORK: &str = "exchange book → us (network)";
 
 pub struct Telemetry {
     /// Microseconds, per hop.
@@ -110,7 +110,7 @@ impl Telemetry {
                 self.record(QUEUE, now.saturating_duration_since(stamp.received_at));
             }
             Event::Book(_, stamp) => {
-                self.network(BULLET_NETWORK, stamp);
+                self.network(BOOK_NETWORK, stamp);
                 self.record(QUEUE, now.saturating_duration_since(stamp.received_at));
             }
             Event::Sent {
@@ -286,7 +286,7 @@ impl Telemetry {
         if !self.hops.contains_key(END_TO_END) {
             let _ = writeln!(
                 out,
-                "  (no orders have reached Bullet yet: end-to-end and order-to-live start with \
+                "  (no orders have reached the exchange yet: end-to-end and order-to-live start with \
                  the first live order)"
             );
         }
@@ -305,7 +305,10 @@ impl Telemetry {
         let sync = "Fix the clock (macOS: turn automatic time off and on; Linux: chrony), or trust end-to-end, which doesn't use it.";
         for (skew, what) in [
             (&self.our_clock_behind, "your clock is behind an exchange's"),
-            (&self.our_clock_ahead, "your clock is ahead of Bullet's"),
+            (
+                &self.our_clock_ahead,
+                "your clock is ahead of the exchange's",
+            ),
         ] {
             if skew.count > 0 {
                 let _ = writeln!(
@@ -320,7 +323,7 @@ impl Telemetry {
         if self.exchanges_disagree.count > 0 {
             let _ = writeln!(
                 out,
-                "  ! {} times Binance's and Bullet's clocks disagree by at least {:.0} ms \
+                "  ! {} times Binance's and the exchange's clocks disagree by at least {:.0} ms \
                  (not yours): end-to-end skipped those.",
                 self.exchanges_disagree.count,
                 self.exchanges_disagree.max_us as f64 / 1000.0
@@ -578,7 +581,7 @@ mod tests {
         assert!(!t.hops.contains_key(END_TO_END));
         let table = t.table();
         assert!(
-            table.contains("Binance's and Bullet's clocks disagree"),
+            table.contains("Binance's and the exchange's clocks disagree"),
             "{table}"
         );
         assert!(!table.contains("your clock is behind"), "{table}");
@@ -627,7 +630,7 @@ mod tests {
             assert!(table.contains(hop), "{hop} missing:\n{table}");
         }
         assert!(
-            table.contains("no orders have reached Bullet yet"),
+            table.contains("no orders have reached the exchange yet"),
             "{table}"
         );
     }
