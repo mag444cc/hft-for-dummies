@@ -37,9 +37,9 @@ pub enum Event {
         ask: Decimal,
         stamp: Stamp,
     },
-    /// Bullet's order book changed.
+    /// The exchange's order book changed.
     Book(Book, Stamp),
-    /// Our copy of the Bullet book is out of sync; don't trust it.
+    /// Our copy of the order book is out of sync; don't trust it.
     BookLost,
     /// One of our orders (partly) filled.
     Fill(Fill),
@@ -59,9 +59,9 @@ pub enum Event {
     CancelFailed,
     /// Our position according to the exchange (answer to [`Intent::SyncPosition`]).
     Position(Decimal),
-    /// The Bullet websocket dropped and is reconnecting. We may have missed things.
+    /// An exchange websocket dropped and is reconnecting. We may have missed things.
     Reconnecting,
-    /// The Bullet websocket is gone for good.
+    /// An exchange websocket is gone for good.
     Disconnected(String),
     /// Once a second, so time-based checks (staleness) run even when the market is quiet.
     Tick,

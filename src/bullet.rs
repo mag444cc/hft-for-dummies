@@ -28,6 +28,7 @@ use serde::Deserialize;
 use crate::book::{BookEvent, BookKeeper};
 use crate::config::Config;
 use crate::events::{Bus, Event, Fill, Order, Side, Stamp};
+use crate::executor::{Batch, Rejected, Venue};
 
 pub struct Bullet {
     client: Client,
@@ -216,6 +217,33 @@ impl Bullet {
             .iter()
             .find(|p| p.symbol == self.symbol)
             .map_or(Decimal::ZERO, |p| p.position_amt))
+    }
+}
+
+impl Venue for Bullet {
+    /// Bullet takes the whole batch in one request, all or nothing, so
+    /// nothing is ever rejected on its own.
+    async fn submit(&mut self, batch: &Batch) -> Result<Rejected> {
+        let mut cancels = batch.cancels.clone();
+        let mut places = batch.places.clone();
+        for (old, new) in &batch.replaces {
+            cancels.push(*old);
+            places.push(*new);
+        }
+        self.cancel_and_place(&cancels, &places).await?;
+        Ok(Rejected::default())
+    }
+
+    async fn cancel_all(&mut self) -> Result<()> {
+        Bullet::cancel_all(self).await
+    }
+
+    async fn position(&mut self) -> Result<Decimal> {
+        Bullet::position(self).await
+    }
+
+    async fn fills_since(&mut self, since_unix_us: u64) -> Result<Vec<Fill>> {
+        Bullet::fills_since(self, since_unix_us).await
     }
 }
 

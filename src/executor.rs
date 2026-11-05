@@ -1,22 +1,24 @@
 //! Executors carry out the strategy's intents and report back as events.
 //!
-//! - [`LiveExecutor`] sends real orders to Bullet.
+//! - [`LiveExecutor`] sends real orders to an exchange (a [`Venue`]: Bullet or
+//!   Hyperliquid).
 //! - [`PaperExecutor`] pretends to (dry run): it remembers the orders and
-//!   fills them when the real Bullet book trades through their price.
+//!   fills them when the real order book trades through their price.
 //!
 //! The strategy can't tell the two apart, so what you see in dry run is the
 //! same code path that trades live.
 //!
 //! Handing intents to an executor never waits: the live one passes them to a
 //! worker task and returns at once, so the bot keeps reading prices while a
-//! request to Bullet is in flight. Results come back as events.
+//! request to the exchange is in flight. Results come back as events.
 
 use std::time::Instant;
 
+use anyhow::Result;
+use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::bullet::Bullet;
 use crate::events::{Bus, Event, Fill, Intent, Order, SentKind, Side};
 
 pub trait Executor {
@@ -30,17 +32,69 @@ pub trait Executor {
     async fn finish(self);
 }
 
-/// Sends intents to a worker task that talks to Bullet, one batch at a time.
+/// The order changes from one batch of intents, sent together.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Batch {
+    /// Orders to cancel, by client id.
+    pub cancels: Vec<u64>,
+    /// Resting orders (by client id) to swap for new ones.
+    pub replaces: Vec<(u64, Order)>,
+    /// New orders.
+    pub places: Vec<Order>,
+}
+
+impl Batch {
+    fn is_empty(&self) -> bool {
+        self.cancels.is_empty() && self.replaces.is_empty() && self.places.is_empty()
+    }
+
+    /// Client ids of every new order in the batch.
+    fn new_ids(&self) -> Vec<u64> {
+        let replaced = self.replaces.iter().map(|(_, new)| new.client_id);
+        replaced
+            .chain(self.places.iter().map(|o| o.client_id))
+            .collect()
+    }
+}
+
+/// What the exchange turned down in a request that otherwise went through.
+/// Bullet takes a request whole or not at all; Hyperliquid answers order by
+/// order, so one order can be rejected while the rest rest.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Rejected {
+    /// New orders that are not resting.
+    pub client_ids: Vec<u64>,
+    /// A cancel (or the old half of a replace) failed: an order may still rest.
+    pub cancel_failed: bool,
+}
+
+/// An exchange the bot can trade on. Each one (`bullet.rs`, `hyperliquid.rs`)
+/// turns these into its own requests. The `+ Send` lets the worker run on
+/// tokio's thread pool.
+pub trait Venue: Send + 'static {
+    /// Send one batch of cancels, replaces and new orders (all post-only).
+    /// `Err` means none of it can be trusted to have happened.
+    fn submit(&mut self, batch: &Batch) -> impl Future<Output = Result<Rejected>> + Send;
+    /// Cancel every order we have on this market, tracked or not.
+    fn cancel_all(&mut self) -> impl Future<Output = Result<()>> + Send;
+    /// Our position according to the exchange (positive = long).
+    fn position(&mut self) -> impl Future<Output = Result<Decimal>> + Send;
+    /// Our fills on this market since `since_unix_us`, from the exchange's own record.
+    fn fills_since(&mut self, since_unix_us: u64)
+    -> impl Future<Output = Result<Vec<Fill>>> + Send;
+}
+
+/// Sends intents to a worker task that talks to the exchange, one batch at a time.
 pub struct LiveExecutor {
     queue: mpsc::UnboundedSender<Vec<Intent>>,
     worker: JoinHandle<()>,
 }
 
 impl LiveExecutor {
-    pub fn new(bullet: Bullet, bus: Bus) -> Self {
+    pub fn new(venue: impl Venue, bus: Bus) -> Self {
         let (queue, mut batches) = mpsc::unbounded_channel::<Vec<Intent>>();
         let mut worker = Worker {
-            bullet,
+            venue,
             bus,
             fills_since_us: None,
         };
@@ -68,32 +122,30 @@ impl Executor for LiveExecutor {
     }
 }
 
-struct Worker {
-    bullet: Bullet,
+struct Worker<V> {
+    venue: V,
     bus: Bus,
     /// Fills from this time on (µs since 1970) are ours to count. Set when we
     /// read the starting position: everything before is already in it.
     fills_since_us: Option<u64>,
 }
 
-impl Worker {
+impl<V: Venue> Worker<V> {
     async fn run(&mut self, intents: Vec<Intent>) {
-        let mut cancels = Vec::new();
-        let mut replaces = Vec::new();
-        let mut places = Vec::new();
+        let mut batch = Batch::default();
         for intent in intents {
             match intent {
-                Intent::Place(order) => places.push(order),
-                Intent::Replace { old, new } => replaces.push((old, new)),
-                Intent::Cancel { client_id } => cancels.push(client_id),
+                Intent::Place(order) => batch.places.push(order),
+                Intent::Replace { old, new } => batch.replaces.push((old, new)),
+                Intent::Cancel { client_id } => batch.cancels.push(client_id),
                 Intent::CancelAll => {
-                    if let Err(e) = self.bullet.cancel_all().await {
+                    if let Err(e) = self.venue.cancel_all().await {
                         tracing::error!(
-                            "cancel all failed, check the Bullet app for resting orders: {e}"
+                            "cancel all failed, check the exchange's app for resting orders: {e}"
                         );
                     }
                 }
-                Intent::SyncPosition => match self.bullet.position().await {
+                Intent::SyncPosition => match self.venue.position().await {
                     Ok(position) => {
                         // Fills before this read are already in `position`. Our
                         // clock may be off from the exchange's, so start counting
@@ -110,64 +162,58 @@ impl Worker {
                     let Some(since) = self.fills_since_us else {
                         continue;
                     };
-                    match self.bullet.fills_since(since).await {
+                    match self.venue.fills_since(since).await {
                         Ok(fills) => fills.into_iter().for_each(|f| self.send(Event::Fill(f))),
                         Err(e) => tracing::warn!("checking our fills failed (will retry): {e}"),
                     }
                 }
             }
         }
-
-        // Everything goes in one request: cancels (including the old side of
+        if batch.is_empty() {
+            return;
+        }
+        // Everything goes out together: cancels (including the old side of
         // each moved quote) and new orders. A cancel for an order that filled
-        // just before it arrived is skipped by Bullet, so that race needs no
-        // special handling.
-        let kind = match (replaces.is_empty(), places.is_empty()) {
+        // just before it arrived is skipped by the exchange, so that race
+        // needs no special handling.
+        let kind = match (batch.replaces.is_empty(), batch.places.is_empty()) {
             (false, _) => SentKind::Replace,
             (true, false) => SentKind::Place,
             (true, true) => SentKind::Cancel,
         };
-        cancels.extend(replaces.iter().map(|(old, _)| *old));
-        places.extend(replaces.into_iter().map(|(_, new)| new));
-        if cancels.is_empty() && places.is_empty() {
-            return;
-        }
-        let new_ids: Vec<u64> = places.iter().map(|o| o.client_id).collect();
-        if let Err(e) = self
-            .timed(kind, self.bullet.cancel_and_place(&cancels, &places))
-            .await
-        {
-            // Nothing in the request happened, but we may not have heard back
-            // from a request that did. Tell the strategy, which cancels
-            // everything and starts its quotes afresh.
-            tracing::warn!("sending orders failed (often: not enough margin): {e}");
-            self.send(Event::CancelFailed);
-            self.send(Event::PlaceFailed {
-                client_ids: new_ids,
-            });
+        let started = Instant::now();
+        match self.venue.submit(&batch).await {
+            Ok(rejected) => {
+                self.send(Event::Sent {
+                    kind,
+                    started,
+                    finished: Instant::now(),
+                });
+                if rejected.cancel_failed {
+                    tracing::warn!("the exchange refused a cancel");
+                    self.send(Event::CancelFailed);
+                }
+                if !rejected.client_ids.is_empty() {
+                    self.send(Event::PlaceFailed {
+                        client_ids: rejected.client_ids,
+                    });
+                }
+            }
+            Err(e) => {
+                // Nothing in the request happened, but we may not have heard back
+                // from a request that did. Tell the strategy, which cancels
+                // everything and starts its quotes afresh.
+                tracing::warn!("sending orders failed (often: not enough margin): {e}");
+                self.send(Event::CancelFailed);
+                self.send(Event::PlaceFailed {
+                    client_ids: batch.new_ids(),
+                });
+            }
         }
     }
 
     fn send(&self, event: Event) {
         let _ = self.bus.send(event);
-    }
-
-    /// Run one request to the exchange and report how long it took.
-    async fn timed<T>(
-        &self,
-        kind: SentKind,
-        request: impl Future<Output = anyhow::Result<T>>,
-    ) -> anyhow::Result<T> {
-        let started = Instant::now();
-        let result = request.await;
-        if result.is_ok() {
-            self.send(Event::Sent {
-                kind,
-                started,
-                finished: Instant::now(),
-            });
-        }
-        result
     }
 }
 
@@ -237,7 +283,7 @@ impl Executor for PaperExecutor {
                 side: order.side,
                 price: order.price,
                 size: order.size,
-                fee: rust_decimal::Decimal::ZERO,
+                fee: Decimal::ZERO,
                 order_finished: true,
             }));
         }
@@ -352,5 +398,142 @@ mod tests {
             &[(d("103"), d("1"))],
         )));
         assert!(events.try_recv().is_err());
+    }
+
+    /// An exchange that records each batch and answers as the test says.
+    struct FakeVenue {
+        sent: Vec<Batch>,
+        answer: fn() -> Result<Rejected>,
+    }
+
+    impl Venue for FakeVenue {
+        async fn submit(&mut self, batch: &Batch) -> Result<Rejected> {
+            self.sent.push(batch.clone());
+            (self.answer)()
+        }
+        async fn cancel_all(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn position(&mut self) -> Result<Decimal> {
+            Ok(Decimal::ZERO)
+        }
+        async fn fills_since(&mut self, _since_unix_us: u64) -> Result<Vec<Fill>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn order(client_id: u64, side: Side, price: &str) -> Order {
+        Order {
+            side,
+            price: d(price),
+            size: d("1"),
+            client_id,
+        }
+    }
+
+    /// Run `intents` through a worker; return what reached the exchange and
+    /// the events reported back (without the timing ones).
+    async fn run(
+        intents: Vec<Intent>,
+        answer: fn() -> Result<Rejected>,
+    ) -> (Vec<Batch>, Vec<Event>) {
+        let (bus, mut events) = mpsc::unbounded_channel();
+        let mut worker = Worker {
+            venue: FakeVenue {
+                sent: Vec::new(),
+                answer,
+            },
+            bus,
+            fills_since_us: None,
+        };
+        worker.run(intents).await;
+        let mut reported = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if !matches!(event, Event::Sent { .. }) {
+                reported.push(event);
+            }
+        }
+        (worker.venue.sent, reported)
+    }
+
+    #[tokio::test]
+    async fn one_batch_of_intents_is_one_request() {
+        let bid = order(2, Side::Buy, "99");
+        let ask = order(3, Side::Sell, "101");
+        let (sent, events) = run(
+            vec![
+                Intent::Replace { old: 1, new: bid },
+                Intent::Place(ask),
+                Intent::Cancel { client_id: 4 },
+            ],
+            || Ok(Rejected::default()),
+        )
+        .await;
+        assert_eq!(
+            sent,
+            vec![Batch {
+                cancels: vec![4],
+                replaces: vec![(1, bid)],
+                places: vec![ask],
+            }]
+        );
+        assert!(events.is_empty(), "all went through: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_pulls_everything() {
+        let (_, events) = run(
+            vec![
+                Intent::Replace {
+                    old: 1,
+                    new: order(2, Side::Buy, "99"),
+                },
+                Intent::Place(order(3, Side::Sell, "101")),
+            ],
+            || Err(anyhow::anyhow!("timed out")),
+        )
+        .await;
+        assert!(matches!(events[0], Event::CancelFailed));
+        let Event::PlaceFailed { client_ids } = &events[1] else {
+            panic!("{events:?}")
+        };
+        assert_eq!(client_ids, &vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_order_is_forgotten_and_nothing_else() {
+        let (_, events) = run(
+            vec![
+                Intent::Place(order(2, Side::Buy, "99")),
+                Intent::Place(order(3, Side::Sell, "101")),
+            ],
+            || {
+                Ok(Rejected {
+                    client_ids: vec![3],
+                    cancel_failed: false,
+                })
+            },
+        )
+        .await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let Event::PlaceFailed { client_ids } = &events[0] else {
+            panic!("{events:?}")
+        };
+        assert_eq!(client_ids, &vec![3]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_cancel_pulls_everything() {
+        let (_, events) = run(vec![Intent::Cancel { client_id: 1 }], || {
+            Ok(Rejected {
+                client_ids: Vec::new(),
+                cancel_failed: true,
+            })
+        })
+        .await;
+        assert!(
+            matches!(events.as_slice(), [Event::CancelFailed]),
+            "{events:?}"
+        );
     }
 }

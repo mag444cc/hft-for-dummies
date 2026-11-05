@@ -4,6 +4,10 @@ Code for the *HFT for dummies* series: a market maker that quotes SOL-USD on
 [Bullet](https://app.bullet.xyz/trade?r=HFT4DUMMIES), priced off Binance's SOL
 perpetual future (perp). Each post is one change to this repo.
 
+It can also quote ETH and BTC, and trade on
+[Hyperliquid](https://app.hyperliquid.xyz) instead of Bullet, still priced off
+Binance: see [Other markets](#other-markets).
+
 > Market making can lose money. The bot starts in **dry run**: no key, no
 > orders.
 
@@ -57,11 +61,31 @@ After a minute of warm-up it quotes, on paper:
 quoting
 paper: place side=Buy price=100.556 size=0.05
 paper: place side=Sell price=100.758 size=0.05
-bullet mid 100.656 | fair 100.6573 | our bid 100.556 ask 100.758 | position 0 | pnl $0 (fees $0)
+mid 100.656 | fair 100.6573 | our bid 100.556 ask 100.758 | position 0 | pnl $0 (fees $0)
 ```
 
 Settings are in `bot.toml`. Using a coding agent? Ask it to *"set me up and
 run the bot"*; `AGENTS.md` has its instructions.
+
+### Other markets
+
+`bot.toml` is SOL on Bullet. The other combinations each have a config in
+[`configs/`](configs/), all on dry run as shipped:
+
+| Market | Bullet | Hyperliquid |
+|--------|--------|-------------|
+| SOL | `cargo run` | `cargo run -- run configs/hyperliquid-sol.toml` |
+| ETH | `cargo run -- run configs/bullet-eth.toml` | `cargo run -- run configs/hyperliquid-eth.toml` |
+| BTC | `cargo run -- run configs/bullet-btc.toml` | `cargo run -- run configs/hyperliquid-btc.toml` |
+
+One bot quotes one market. To quote several at once, run several bots, one
+terminal each; each config has its own metrics port. At startup the bot checks
+the market exists and the order size is allowed there (Hyperliquid: at least
+$10 an order), and says what to change if not.
+
+A config picks its exchange with `venue = "bullet"` (the default) or
+`venue = "hyperliquid"`. On Hyperliquid, `symbol` is the coin (`"ETH"`), not
+`"ETH-USD"`.
 
 ## Going live
 
@@ -78,7 +102,35 @@ run the bot"*; `AGENTS.md` has its instructions.
 
 Limits in `bot.toml`: at most 0.1 SOL held, stops after a $2 loss. Stopping
 doesn't close your position, and the bot cancels any SOL-USD orders you
-place by hand on the same account.
+place by hand on the same account. The same goes for ETH-USD and BTC-USD with
+their configs: `cargo run -- run configs/bullet-eth.toml --live`. They share
+`bot.key`.
+
+### Going live on Hyperliquid
+
+1. **Deposit $50 USDC** on [Hyperliquid](https://app.hyperliquid.xyz) (perps
+   balance). Orders there must be worth at least $10, so the positions are
+   bigger: up to about $30 per market with the shipped configs.
+2. **Make the bot a key:** `cargo run -- keygen --venue hyperliquid`. It writes
+   `hyperliquid.key` (git-ignored) and prints its address. In the app's
+   [API page](https://app.hyperliquid.xyz/API), paste that address as the API
+   wallet, name it, and click **Authorize**. Like a Bullet delegate, an API
+   wallet can trade but never withdraw. Approvals expire: renew it there.
+   Already made one in the app? Paste its private key into `hyperliquid.key`.
+3. **Run it live:** `cargo run -- run configs/hyperliquid-sol.toml --live`
+   (or `-eth`, `-btc`). Ctrl-C cancels its orders.
+
+Differences from Bullet, all handled by the bot:
+
+- Hyperliquid orders don't expire, so the bot keeps a *dead man's switch*
+  armed: if it dies without cancelling, Hyperliquid cancels its orders 30s
+  later. If Hyperliquid won't arm it, the bot warns you and carries on; then
+  cancel by hand in the app after a crash.
+- Each account gets 10,000 requests, then one more per $1 traded. The configs
+  requote at most every 2 seconds, but a long run at these sizes can still use
+  them up. The bot then gets refusals; watch the log.
+- Prices allow 5 significant figures, so the price step changes with the price
+  (0.001 below $100, 0.01 above).
 
 ## The code
 
@@ -90,12 +142,14 @@ Feeds turn the world into **events**, the market maker answers with
 | `src/events.rs` | Every `Event` in and `Intent` out. Start here. |
 | `src/bot.rs` | The loop that wires it together |
 | `src/binance.rs`, `src/bullet.rs` | Feeds; `bullet.rs` also sends orders |
+| `src/hyperliquid.rs` | Hyperliquid's feeds and orders: the same job as `bullet.rs` |
+| `src/hyperliquid_sign.rs` | Signing Hyperliquid requests, checked against the official SDK |
 | `src/book.rs` | Our copy of the Bullet order book |
-| `src/fair_value.rs` | Binance mid + average Binance→Bullet gap |
+| `src/fair_value.rs` | Binance mid + average gap to the exchange we trade on |
 | `src/strategy.rs` | Bid and ask prices: spread, skew, limits |
 | `src/market_maker.rs` | Events in, intents out. No I/O, fully tested |
 | `src/inventory.rs` | Position and PnL, changed only by fills |
-| `src/executor.rs` | Live orders, or paper ones in dry run |
+| `src/executor.rs` | Live orders on either exchange (the `Venue` trait), or paper ones in dry run |
 
 ## Following along
 
