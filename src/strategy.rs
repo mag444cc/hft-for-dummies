@@ -71,6 +71,28 @@ pub struct Quotes {
     pub ask: Option<Decimal>,
 }
 
+/// Changes to the plain quote that the market maker can ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adjust {
+    /// How much of `skew_bps` to apply: 1 = all of it, 0 = none.
+    pub skew: Decimal,
+    /// Move the bid this many bps further from fair value.
+    pub bid_bps: Decimal,
+    /// Move the ask this many bps further from fair value.
+    pub ask_bps: Decimal,
+}
+
+impl Adjust {
+    /// No changes: the plain quote.
+    pub const NONE: Adjust = Adjust {
+        skew: Decimal::ONE,
+        bid_bps: Decimal::ZERO,
+        ask_bps: Decimal::ZERO,
+    };
+}
+
+/// [`quote_adjusted`] with no adjustments (used by the tests below).
+#[cfg(test)]
 pub fn quote(
     fair: Decimal,
     position: Decimal,
@@ -79,12 +101,33 @@ pub fn quote(
     ticks: Ticks,
     spread_bps: Decimal,
 ) -> Quotes {
+    quote_adjusted(
+        fair,
+        position,
+        config,
+        book,
+        ticks,
+        spread_bps,
+        Adjust::NONE,
+    )
+}
+
+/// [`quote`], with the skew scaled and each side pushed out by `adjust`.
+pub fn quote_adjusted(
+    fair: Decimal,
+    position: Decimal,
+    config: &Config,
+    book: &Book,
+    ticks: Ticks,
+    spread_bps: Decimal,
+    adjust: Adjust,
+) -> Quotes {
     // How full our inventory is, from -1 (max short) to +1 (max long).
     let fullness = (position / config.max_position).clamp(Decimal::NEGATIVE_ONE, Decimal::ONE);
-    let lean_bps = config.skew_bps * fullness;
+    let lean_bps = config.skew_bps * fullness * adjust.skew;
 
-    let bid = fair * (Decimal::ONE - (spread_bps + lean_bps) / BPS);
-    let ask = fair * (Decimal::ONE + (spread_bps - lean_bps) / BPS);
+    let bid = fair * (Decimal::ONE - (spread_bps + lean_bps + adjust.bid_bps) / BPS);
+    let ask = fair * (Decimal::ONE + (spread_bps - lean_bps + adjust.ask_bps) / BPS);
 
     let room_to_buy = position + config.order_size <= config.max_position;
     let room_to_sell = position - config.order_size >= -config.max_position;

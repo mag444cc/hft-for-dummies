@@ -62,6 +62,22 @@ pub struct Config {
     /// How far back `momentum_lean` looks.
     #[serde(default = "default_momentum_ms")]
     pub momentum_ms: u64,
+    /// When recent fills are lopsided (say we keep getting sold to, so we
+    /// keep buying), move that side's quote up to this many bps further
+    /// away: someone may know the price is about to fall. Scaled by how
+    /// lopsided they are; fills older than `fill_imbalance_secs` don't
+    /// count. Off when unset.
+    #[serde(default)]
+    pub fill_imbalance_bps: Option<Decimal>,
+    #[serde(default = "default_fill_imbalance_secs")]
+    pub fill_imbalance_secs: u64,
+    /// After Binance moves at least this many bps against our position
+    /// within `big_move_secs`, stop skewing (don't cut the position cheaply):
+    /// prices tend to snap back a little after a big move. Off when unset.
+    #[serde(default)]
+    pub big_move_bps: Option<Decimal>,
+    #[serde(default = "default_big_move_secs")]
+    pub big_move_secs: u64,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -101,6 +117,14 @@ fn default_bybit_weight() -> Decimal {
 
 fn default_momentum_ms() -> u64 {
     1000
+}
+
+fn default_fill_imbalance_secs() -> u64 {
+    60
+}
+
+fn default_big_move_secs() -> u64 {
+    300
 }
 
 /// The exchanges the bot can trade on.
@@ -165,6 +189,18 @@ impl Config {
         }
         if self.momentum_lean.is_some() && self.momentum_ms == 0 {
             bail!("momentum_ms must be greater than 0");
+        }
+        if self.fill_imbalance_bps.is_some_and(|b| b <= Decimal::ZERO) {
+            bail!("fill_imbalance_bps must be greater than 0");
+        }
+        if self.fill_imbalance_bps.is_some() && self.fill_imbalance_secs == 0 {
+            bail!("fill_imbalance_secs must be greater than 0");
+        }
+        if self.big_move_bps.is_some_and(|b| b <= Decimal::ZERO) {
+            bail!("big_move_bps must be greater than 0");
+        }
+        if self.big_move_bps.is_some() && self.big_move_secs == 0 {
+            bail!("big_move_secs must be greater than 0");
         }
         if self.vol_spread_mult.is_some_and(|m| m <= Decimal::ZERO) {
             bail!("vol_spread_mult must be greater than 0");
@@ -338,6 +374,26 @@ mod tests {
         config.momentum_lean = Some(Decimal::ONE);
         assert!(config.validate().is_ok());
         config.momentum_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn position_handling_is_off_unless_asked_for_and_must_be_positive() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(config.fill_imbalance_bps, None);
+        assert_eq!(config.big_move_bps, None);
+        assert_eq!(
+            (config.fill_imbalance_secs, config.big_move_secs),
+            (60, 300)
+        );
+        config.fill_imbalance_bps = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.fill_imbalance_bps = Some(Decimal::ONE);
+        assert!(config.validate().is_ok());
+        config.big_move_bps = Some(Decimal::NEGATIVE_ONE);
+        assert!(config.validate().is_err());
+        config.big_move_bps = Some(Decimal::TEN);
+        config.big_move_secs = 0;
         assert!(config.validate().is_err());
     }
 

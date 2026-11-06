@@ -8,6 +8,7 @@
 //! ask at most. It updates that belief the moment it asks for a change, and
 //! corrects it if the executor reports a failure.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
@@ -18,7 +19,7 @@ use crate::events::{Event, Fill, Intent, Order, Side};
 use crate::fair_value::{FairValue, NotReady};
 use crate::inventory::Inventory;
 use crate::momentum::Momentum;
-use crate::strategy::{self, Quotes, Ticks};
+use crate::strategy::{self, Adjust, Quotes, Ticks};
 use crate::volatility::Volatility;
 
 /// The most `momentum_lean` may shift fair value, in bps.
@@ -39,6 +40,10 @@ pub struct MarketMaker {
     volatility: Option<Volatility>,
     /// Which way Binance is going (only with `momentum_lean`).
     momentum: Option<Momentum>,
+    /// Binance's move over `big_move_secs` (only with `big_move_bps`).
+    big_move: Option<Momentum>,
+    /// Our recent fills: when, which side, how much (only with `fill_imbalance_bps`).
+    recent_fills: VecDeque<(Instant, Side, Decimal)>,
     book: Option<(Book, Instant)>,
     bid: Option<Order>,
     ask: Option<Order>,
@@ -75,6 +80,9 @@ impl MarketMaker {
         let momentum = config
             .momentum_lean
             .map(|_| Momentum::new(Duration::from_millis(config.momentum_ms)));
+        let big_move = config
+            .big_move_bps
+            .map(|_| Momentum::new(Duration::from_secs(config.big_move_secs)));
         let fair = FairValue::new(config.bybit_weight);
         Self {
             config,
@@ -82,6 +90,8 @@ impl MarketMaker {
             fair,
             volatility,
             momentum,
+            big_move,
+            recent_fills: VecDeque::new(),
             book: None,
             bid: None,
             ask: None,
@@ -124,6 +134,9 @@ impl MarketMaker {
                 }
                 if let Some(momentum) = &mut self.momentum {
                     momentum.on_price(mid, stamp.received_at);
+                }
+                if let Some(big_move) = &mut self.big_move {
+                    big_move.on_price(mid, stamp.received_at);
                 }
             }
             Event::SecondReference { bid, ask, stamp } => {
@@ -293,13 +306,14 @@ impl MarketMaker {
         }
         match self.fair.get(now, self.reference_stale()) {
             Ok(fair) => (
-                strategy::quote(
+                strategy::quote_adjusted(
                     self.lean_with_binance(fair),
                     self.inventory.position,
                     &self.config,
                     book,
                     self.ticks,
                     self.spread_bps(),
+                    self.adjust(now),
                 ),
                 "quoting",
             ),
@@ -319,6 +333,17 @@ impl MarketMaker {
         // What this fill earned against fair value right now: the spread part
         // of our profit (the rest is what the position did afterwards).
         self.trades += 1;
+        if self.config.fill_imbalance_bps.is_some() {
+            self.recent_fills.push_back((now, fill.side, fill.size));
+            let keep = Duration::from_secs(self.config.fill_imbalance_secs);
+            while self
+                .recent_fills
+                .front()
+                .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) > keep)
+            {
+                self.recent_fills.pop_front();
+            }
+        }
         if let Ok(fair) = self.fair.get(now, self.reference_stale()) {
             self.spread_profit += match fill.side {
                 Side::Buy => (fair - fill.price) * fill.size,
@@ -409,6 +434,42 @@ impl MarketMaker {
         };
         let shift = (moved * lean).clamp(-MAX_MOMENTUM_LEAN_BPS, MAX_MOMENTUM_LEAN_BPS);
         fair * (Decimal::ONE + shift / Decimal::from(10_000))
+    }
+
+    /// Position handling on top of the plain quote (see `fill_imbalance_bps`
+    /// and `big_move_bps`).
+    fn adjust(&self, now: Instant) -> Adjust {
+        let mut adjust = Adjust::NONE;
+        if let Some(bps) = self.config.fill_imbalance_bps {
+            // From -1 (all our recent fills were sells) to +1 (all buys).
+            let keep = Duration::from_secs(self.config.fill_imbalance_secs);
+            let (mut bought, mut sold) = (Decimal::ZERO, Decimal::ZERO);
+            for (at, side, size) in &self.recent_fills {
+                if now.saturating_duration_since(*at) <= keep {
+                    match side {
+                        Side::Buy => bought += size,
+                        Side::Sell => sold += size,
+                    }
+                }
+            }
+            let total = bought + sold;
+            if !total.is_zero() {
+                let lopsided = (bought - sold) / total;
+                adjust.bid_bps = bps * lopsided.max(Decimal::ZERO);
+                adjust.ask_bps = bps * (-lopsided).max(Decimal::ZERO);
+            }
+        }
+        if let (Some(limit), Some(big_move)) = (self.config.big_move_bps, &self.big_move)
+            && let Some(moved) = big_move.move_bps()
+        {
+            let position = self.inventory.position;
+            let against = (position > Decimal::ZERO && moved <= -limit)
+                || (position < Decimal::ZERO && moved >= limit);
+            if against {
+                adjust.skew = Decimal::ZERO;
+            }
+        }
+        adjust
     }
 
     /// The spread to quote: `spread_bps`, or wider if the market is jumpy.
@@ -858,6 +919,85 @@ mod tests {
             intents.iter().all(|i| matches!(i, Intent::Cancel { .. })),
             "{intents:?}"
         );
+    }
+
+    /// We bought (or sold) 1 at 100, trade `id`, with no order of ours behind it.
+    fn filled(mm: &mut MarketMaker, id: u64, side: Side, at: Instant) {
+        let fill = Fill {
+            trade_id: id,
+            client_id: None,
+            side,
+            price: d("100"),
+            size: d("1"),
+            fee: Decimal::ZERO,
+            order_finished: false,
+        };
+        mm.on_event(&Event::Fill(fill), at);
+    }
+
+    /// Binance and the book both still at 99.5 / 100.5 at `at`.
+    fn still(mm: &mut MarketMaker, at: Instant) {
+        binance(mm, "99.5", "100.5", at);
+        let book = Book::from_levels(&[(d("99.5"), d("10"))], &[(d("100.5"), d("10"))]);
+        mm.on_event(&Event::Book(book, Stamp::at(at)), at);
+    }
+
+    #[test]
+    fn lopsided_fills_push_that_side_away_until_they_age_out() {
+        let (mut mm, now) = warmed_up();
+        mm.config.max_position = d("10");
+        mm.config.fill_imbalance_bps = Some(d("10"));
+        // Sold to twice in a row: we bought 2. Someone may know something.
+        filled(&mut mm, 1, Side::Buy, now);
+        filled(&mut mm, 2, Side::Buy, now);
+        let q = mm.wanted_quotes(now).0;
+        assert_eq!((q.bid, q.ask), (Some(d("99.80")), Some(d("100.10"))));
+        // A sell evens it out half way: 2 bought, 1 sold, a third lopsided.
+        filled(&mut mm, 3, Side::Sell, now);
+        let q = mm.wanted_quotes(now).0;
+        assert_eq!(q.bid, Some(d("99.86")), "10 bps x 1/3 further away");
+        // A minute later those fills no longer count.
+        let later = now + Duration::from_secs(61);
+        still(&mut mm, later);
+        let q = mm.wanted_quotes(later).0;
+        assert_eq!((q.bid, q.ask), (Some(d("99.90")), Some(d("100.10"))));
+    }
+
+    /// Long 1 (half of max 2) with 10 bps skew, then Binance falls 30 bps.
+    fn long_after_a_drop(big_move: Option<&str>) -> Quotes {
+        let (mut mm, now) = warmed_up();
+        mm.config.skew_bps = d("10");
+        mm.config.big_move_bps = big_move.map(d);
+        mm.config.big_move_secs = 60;
+        mm.big_move = mm
+            .config
+            .big_move_bps
+            .map(|_| Momentum::new(Duration::from_secs(60)));
+        // Replay the warm-up's Binance prices into the new tracker.
+        for s in 0..=60 {
+            if let Some(b) = &mut mm.big_move {
+                b.on_price(d("100"), now - Duration::from_secs(60 - s));
+            }
+        }
+        filled(&mut mm, 1, Side::Buy, now);
+        let soon = now + Duration::from_secs(1);
+        binance(&mut mm, "99.2", "100.2", soon);
+        mm.wanted_quotes(soon).0
+    }
+
+    #[test]
+    fn a_big_move_against_us_stops_the_skew() {
+        // Normally the skew leans both quotes down 5 bps to sell the long.
+        let normal = long_after_a_drop(None);
+        assert_eq!(
+            (normal.bid, normal.ask),
+            (Some(d("99.55")), Some(d("99.75")))
+        );
+        // After a 30 bps drop (limit 20) we don't cut it cheaply: no skew.
+        let held = long_after_a_drop(Some("20"));
+        assert_eq!((held.bid, held.ask), (Some(d("99.60")), Some(d("99.80"))));
+        // A 40 bps limit isn't reached: the skew stays.
+        assert_eq!(long_after_a_drop(Some("40")), normal);
     }
 
     #[test]
