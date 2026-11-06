@@ -17,8 +17,12 @@ use crate::config::Config;
 use crate::events::{Event, Fill, Intent, Order, Side};
 use crate::fair_value::{FairValue, NotReady};
 use crate::inventory::Inventory;
+use crate::momentum::Momentum;
 use crate::strategy::{self, Quotes, Ticks};
 use crate::volatility::Volatility;
+
+/// The most `momentum_lean` may shift fair value, in bps.
+const MAX_MOMENTUM_LEAN_BPS: Decimal = Decimal::TEN;
 
 /// How much Binance history the volatility spread looks at.
 const VOL_WINDOW: Duration = Duration::from_secs(60);
@@ -33,6 +37,8 @@ pub struct MarketMaker {
     fair: FairValue,
     /// How jumpy Binance is (only with `vol_spread_mult`).
     volatility: Option<Volatility>,
+    /// Which way Binance is going (only with `momentum_lean`).
+    momentum: Option<Momentum>,
     book: Option<(Book, Instant)>,
     bid: Option<Order>,
     ask: Option<Order>,
@@ -63,11 +69,15 @@ impl MarketMaker {
                 VOL_WINDOW,
             )
         });
+        let momentum = config
+            .momentum_lean
+            .map(|_| Momentum::new(Duration::from_millis(config.momentum_ms)));
         Self {
             config,
             ticks,
             fair: FairValue::default(),
             volatility,
+            momentum,
             book: None,
             bid: None,
             ask: None,
@@ -102,8 +112,12 @@ impl MarketMaker {
         match event {
             Event::Reference { bid, ask, stamp } => {
                 self.fair.on_binance(*bid, *ask, stamp.received_at);
+                let mid = (*bid + *ask) / Decimal::TWO;
                 if let Some(volatility) = &mut self.volatility {
-                    volatility.on_price((*bid + *ask) / Decimal::TWO, stamp.received_at);
+                    volatility.on_price(mid, stamp.received_at);
+                }
+                if let Some(momentum) = &mut self.momentum {
+                    momentum.on_price(mid, stamp.received_at);
                 }
             }
             Event::Book(book, _) => {
@@ -275,7 +289,7 @@ impl MarketMaker {
         match self.fair.get(now, self.reference_stale()) {
             Ok(fair) => (
                 strategy::quote(
-                    fair,
+                    self.lean_with_binance(fair),
                     self.inventory.position,
                     &self.config,
                     book,
@@ -369,6 +383,18 @@ impl MarketMaker {
 
     fn basis_halflife(&self) -> Duration {
         Duration::from_secs(self.config.basis_halflife_secs)
+    }
+
+    /// Fair value shifted the way Binance just went (with `momentum_lean`).
+    fn lean_with_binance(&self, fair: Decimal) -> Decimal {
+        let (Some(lean), Some(momentum)) = (self.config.momentum_lean, &self.momentum) else {
+            return fair;
+        };
+        let Some(moved) = momentum.move_bps() else {
+            return fair;
+        };
+        let shift = (moved * lean).clamp(-MAX_MOMENTUM_LEAN_BPS, MAX_MOMENTUM_LEAN_BPS);
+        fair * (Decimal::ONE + shift / Decimal::from(10_000))
     }
 
     /// The spread to quote: `spread_bps`, or wider if the market is jumpy.
@@ -587,6 +613,63 @@ mod tests {
         assert!(
             spread >= d("9.5") && spread <= d("11"),
             "quoted {spread} bps"
+        );
+    }
+
+    /// Warmed up, then Binance moves `by` (in price) over one second, with
+    /// the book following. Returns the bid and ask quoted right after.
+    fn quotes_after_binance_moves(by: &str, lean: Option<&str>) -> (Decimal, Decimal) {
+        let (mut mm, start) = warmed_up();
+        mm.config.momentum_lean = lean.map(d);
+        mm.momentum = mm
+            .config
+            .momentum_lean
+            .map(|_| Momentum::new(Duration::from_secs(1)));
+        let mut now = start;
+        for step in 0..=50u64 {
+            now = start + Duration::from_millis(step * 20);
+            let mid = d("100") + d(by) * Decimal::from(step) / Decimal::from(50);
+            let half = d("0.5");
+            let reference = Event::Reference {
+                bid: mid - half,
+                ask: mid + half,
+                stamp: Stamp::at(now),
+            };
+            mm.on_event(&reference, now);
+        }
+        let p = places(&mm.requote(now));
+        (p[0].1, p[1].1)
+    }
+
+    #[test]
+    fn leans_the_way_binance_just_moved() {
+        // Binance up 10 bps in a second; lean 0.5 shifts both quotes up 5 bps.
+        let (bid, ask) = quotes_after_binance_moves("0.1", None);
+        let (lean_bid, lean_ask) = quotes_after_binance_moves("0.1", Some("0.5"));
+        assert_eq!(lean_bid - bid, d("0.05"));
+        assert_eq!(lean_ask - ask, d("0.05"));
+    }
+
+    #[test]
+    fn leans_down_when_binance_falls() {
+        let (bid, _) = quotes_after_binance_moves("-0.1", None);
+        let (lean_bid, _) = quotes_after_binance_moves("-0.1", Some("0.5"));
+        assert_eq!(lean_bid - bid, d("-0.05"));
+    }
+
+    #[test]
+    fn the_lean_is_capped() {
+        // Binance up 20 bps: lean 1 would shift 20 bps, capped at 10 (0.10).
+        let (bid, _) = quotes_after_binance_moves("0.2", None);
+        let (lean_bid, _) = quotes_after_binance_moves("0.2", Some("1"));
+        assert_eq!(lean_bid - bid, d("0.10"));
+    }
+
+    #[test]
+    fn no_lean_when_binance_is_still() {
+        assert_eq!(
+            quotes_after_binance_moves("0", Some("0.5")),
+            quotes_after_binance_moves("0", None)
         );
     }
 

@@ -17,6 +17,7 @@ mod inventory;
 mod key;
 mod liveness;
 mod market_maker;
+mod momentum;
 mod strategy;
 mod telemetry;
 mod volatility;

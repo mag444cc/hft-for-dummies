@@ -47,6 +47,14 @@ pub struct Config {
     /// the last minute). `spread_bps` stays the minimum. Off when unset.
     #[serde(default)]
     pub vol_spread_mult: Option<Decimal>,
+    /// Lean both quotes the way Binance just went: shift fair value by this
+    /// fraction of Binance's move over the last `momentum_ms` (capped at
+    /// 10 bps), so a quote isn't left where the price is heading. Off when unset.
+    #[serde(default)]
+    pub momentum_lean: Option<Decimal>,
+    /// How far back `momentum_lean` looks.
+    #[serde(default = "default_momentum_ms")]
+    pub momentum_ms: u64,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -78,6 +86,10 @@ pub struct Config {
     /// (`infra/grafana`). Off when unset.
     #[serde(default)]
     pub metrics_port: Option<u16>,
+}
+
+fn default_momentum_ms() -> u64 {
+    1000
 }
 
 /// The exchanges the bot can trade on.
@@ -130,6 +142,12 @@ impl Config {
             && urgent <= Decimal::ZERO
         {
             bail!("urgent_requote_bps must be greater than 0, got {urgent}");
+        }
+        if self.momentum_lean.is_some_and(|m| m <= Decimal::ZERO) {
+            bail!("momentum_lean must be greater than 0");
+        }
+        if self.momentum_lean.is_some() && self.momentum_ms == 0 {
+            bail!("momentum_ms must be greater than 0");
         }
         if self.vol_spread_mult.is_some_and(|m| m <= Decimal::ZERO) {
             bail!("vol_spread_mult must be greater than 0");
@@ -280,6 +298,19 @@ mod tests {
         assert!(config.validate().is_err());
         config.urgent_requote_bps = Some(Decimal::ONE);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_momentum_lean_must_be_positive() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(config.momentum_lean, None, "off unless asked for");
+        assert_eq!(config.momentum_ms, 1000);
+        config.momentum_lean = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.momentum_lean = Some(Decimal::ONE);
+        assert!(config.validate().is_ok());
+        config.momentum_ms = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
