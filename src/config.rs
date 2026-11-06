@@ -97,6 +97,14 @@ pub struct Config {
     /// minimum `channel_fit`, all of it for a perfect line.
     #[serde(default)]
     pub channel_scale_by_fit: bool,
+    /// Near a channel edge, hold a position the bounce favours (long near
+    /// the bottom, short near the top) longer: weaken the skew by this
+    /// fraction (0 to 1), and cut the other kind faster (strengthen it as
+    /// much). Back to normal once the price has stayed out longer than the
+    /// channel's own usual time back to the line, or the channel breaks.
+    /// Needs `channel_lean_bps`. Off when unset.
+    #[serde(default)]
+    pub channel_hold: Option<Decimal>,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -234,6 +242,15 @@ impl Config {
         }
         if self.channel_lean_bps.is_some() && self.channel_secs < 600 {
             bail!("channel_secs must be at least 600 (ten minutes)");
+        }
+        if self
+            .channel_hold
+            .is_some_and(|h| h <= Decimal::ZERO || h > Decimal::ONE)
+        {
+            bail!("channel_hold must be above 0 and at most 1");
+        }
+        if self.channel_hold.is_some() && self.channel_lean_bps.is_none() {
+            bail!("channel_hold needs channel_lean_bps (the channel it holds in)");
         }
         if !(0.0..1.0).contains(&self.channel_fit) {
             bail!("channel_fit must be at least 0 and below 1");
@@ -439,6 +456,15 @@ mod tests {
         assert_eq!(config.channel_lean_bps, None);
         assert_eq!((config.channel_secs, config.channel_fit), (7200, 0.7));
         assert!(!config.channel_fade && !config.channel_scale_by_fit);
+        assert_eq!(config.channel_hold, None);
+        config.channel_hold = Some(Decimal::new(5, 1));
+        assert!(config.validate().is_err(), "needs a channel lean");
+        config.channel_lean_bps = Some(Decimal::TWO);
+        assert!(config.validate().is_ok());
+        config.channel_hold = Some(Decimal::TWO);
+        assert!(config.validate().is_err());
+        config.channel_hold = None;
+        config.channel_lean_bps = None;
         config.channel_lean_bps = Some(Decimal::ZERO);
         assert!(config.validate().is_err());
         config.channel_lean_bps = Some(Decimal::TWO);

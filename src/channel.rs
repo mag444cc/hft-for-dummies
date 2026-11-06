@@ -35,6 +35,10 @@ pub struct Position {
     /// Distance from the line in typical distances: -1 is near the lower
     /// edge, +1 near the upper edge.
     pub distance: f64,
+    /// How long this channel's price has typically taken to come back from
+    /// an edge (one typical distance away) to the line, in seconds. A
+    /// quarter of the window when it hasn't been to an edge and back.
+    pub return_secs: f64,
 }
 
 impl Channel {
@@ -98,11 +102,39 @@ impl Channel {
         if spread == 0.0 {
             return None;
         }
+        let distances: Vec<f64> = xs
+            .iter()
+            .zip(&ys)
+            .map(|(x, y)| off(*x, *y) / spread)
+            .collect();
+        let window = self.window.as_secs_f64();
         Some(Position {
             fit: 1.0 - sse / syy,
-            distance: off(xs[xs.len() - 1], ys[ys.len() - 1]) / spread,
+            distance: distances[distances.len() - 1],
+            return_secs: return_time(&xs, &distances)
+                .unwrap_or(window / 4.0)
+                .clamp(window / 12.0, window / 2.0),
         })
     }
+}
+
+/// The average time from reaching an edge (one typical distance from the
+/// line) to being back near the line (within 0.3), over the visits that
+/// came back; `None` if none did.
+fn return_time(times: &[f64], distances: &[f64]) -> Option<f64> {
+    let (mut total, mut count, mut out_since) = (0.0, 0u32, None::<f64>);
+    for (t, d) in times.iter().zip(distances) {
+        match out_since {
+            None if d.abs() >= 1.0 => out_since = Some(*t),
+            Some(since) if d.abs() <= 0.3 => {
+                total += t - since;
+                count += 1;
+                out_since = None;
+            }
+            _ => {}
+        }
+    }
+    (count > 0).then(|| total / f64::from(count))
 }
 
 #[cfg(test)]
@@ -152,6 +184,27 @@ mod tests {
             c.on_price(100.0 + 0.01 * m as f64, start + secs(60 * m));
         }
         assert_eq!(c.position(), None);
+    }
+
+    #[test]
+    fn measures_how_long_the_price_takes_back_from_an_edge() {
+        // Out to an edge at 0 s and 100 s, back near the line 30 s and 50 s later.
+        let times = [0.0, 10.0, 30.0, 100.0, 120.0, 150.0];
+        let distances = [1.2, 0.8, 0.1, -1.5, -0.6, 0.2];
+        assert_eq!(return_time(&times, &distances), Some(40.0));
+        assert_eq!(
+            return_time(&times[..2], &distances[..2]),
+            None,
+            "never came back"
+        );
+    }
+
+    #[test]
+    fn without_edge_visits_the_return_time_is_a_quarter_of_the_window() {
+        // The climb's wiggle never strays a full typical distance and back... except
+        // at the end, so the fallback applies: 7200 s / 4.
+        let p = climb(101.2).position().unwrap();
+        assert!(p.return_secs >= 600.0 && p.return_secs <= 3600.0, "{p:?}");
     }
 
     #[test]

@@ -46,6 +46,9 @@ pub struct MarketMaker {
     channel: Option<Channel>,
     /// Binance's move over `big_move_secs` (only with `big_move_bps`).
     big_move: Option<Momentum>,
+    /// Since when we've held a position the channel bounce favours, near an
+    /// edge (only with `channel_hold`).
+    holding_since: Option<Instant>,
     /// Our recent fills: when, which side, how much (only with `fill_imbalance_bps`).
     recent_fills: VecDeque<(Instant, Side, Decimal)>,
     book: Option<(Book, Instant)>,
@@ -100,6 +103,7 @@ impl MarketMaker {
             big_move,
             channel,
             recent_fills: VecDeque::new(),
+            holding_since: None,
             book: None,
             bid: None,
             ask: None,
@@ -149,6 +153,7 @@ impl MarketMaker {
                 if let Some(channel) = &mut self.channel {
                     channel.on_price(mid.to_f64().unwrap_or(0.0), stamp.received_at);
                 }
+                self.track_holding(now);
             }
             Event::SecondReference { bid, ask, stamp } => {
                 self.fair.on_bybit(*bid, *ask, stamp.received_at)
@@ -341,6 +346,7 @@ impl MarketMaker {
         if !self.inventory.on_fill(fill) {
             return;
         }
+        self.track_holding(now);
         // What this fill earned against fair value right now: the spread part
         // of our profit (the rest is what the position did afterwards).
         self.trades += 1;
@@ -488,6 +494,61 @@ impl MarketMaker {
         (max * Decimal::from_f64(towards_line).unwrap_or_default()).round_dp(4)
     }
 
+    /// Where the price is in a clean, unbroken channel (`None` otherwise).
+    fn clean_channel(&self) -> Option<channel::Position> {
+        let p = self.channel.as_ref()?.position()?;
+        (p.fit >= self.config.channel_fit && p.distance.abs() <= channel::BROKEN).then_some(p)
+    }
+
+    /// With `channel_hold`: +1 when our position is the kind the bounce
+    /// favours near this edge (long near the bottom, short near the top),
+    /// -1 for the other kind, 0 when not near an edge or flat.
+    fn channel_bias(&self) -> i32 {
+        let Some(p) = self.clean_channel() else {
+            return 0;
+        };
+        let position = self.inventory.position;
+        if p.distance.abs() < 1.0 || position.is_zero() {
+            return 0;
+        }
+        let long = position > Decimal::ZERO;
+        if (p.distance < 0.0) == long { 1 } else { -1 }
+    }
+
+    /// Note when we started holding a favoured position near an edge.
+    fn track_holding(&mut self, now: Instant) {
+        if self.config.channel_hold.is_none() {
+            return;
+        }
+        if self.channel_bias() == 1 {
+            self.holding_since.get_or_insert(now);
+        } else {
+            self.holding_since = None;
+        }
+    }
+
+    /// How much of the skew to apply with `channel_hold` (1 = normal).
+    fn hold_skew(&self, now: Instant) -> Decimal {
+        let (Some(hold), Some(p)) = (self.config.channel_hold, self.clean_channel()) else {
+            return Decimal::ONE;
+        };
+        match self.channel_bias() {
+            1 => {
+                let held = self.holding_since.map_or(0.0, |since| {
+                    now.saturating_duration_since(since).as_secs_f64()
+                });
+                // Past this channel's usual time back to the line: stop waiting.
+                if held > p.return_secs {
+                    Decimal::ONE
+                } else {
+                    Decimal::ONE - hold
+                }
+            }
+            -1 => Decimal::ONE + hold,
+            _ => Decimal::ONE,
+        }
+    }
+
     /// Position handling on top of the plain quote (see `fill_imbalance_bps`
     /// and `big_move_bps`).
     fn adjust(&self, now: Instant) -> Adjust {
@@ -511,6 +572,7 @@ impl MarketMaker {
                 adjust.ask_bps = bps * (-lopsided).max(Decimal::ZERO);
             }
         }
+        adjust.skew = self.hold_skew(now);
         if let (Some(limit), Some(big_move)) = (self.config.big_move_bps, &self.big_move)
             && let Some(moved) = big_move.move_bps()
         {
@@ -1081,7 +1143,60 @@ mod tests {
         mm.config.channel_lean_bps = Some(d("2"));
         mm.config.channel_fade = fade;
         mm.config.channel_scale_by_fit = by_fit;
-        mm.channel_shift_for(channel::Position { fit, distance })
+        mm.channel_shift_for(channel::Position {
+            fit,
+            distance,
+            return_secs: 1800.0,
+        })
+    }
+
+    /// The climb channel ending at `last`, holding `position` (max 2), with
+    /// `channel_hold` 0.5; returns the skew multiplier `seconds` after we
+    /// started holding.
+    fn hold_skew_at(last: f64, position: &str, seconds: u64) -> Decimal {
+        let (mut mm, now) = warmed_up();
+        mm.config.channel_lean_bps = Some(d("2"));
+        mm.config.channel_hold = Some(d("0.5"));
+        let mut channel = Channel::new(Duration::from_secs(7200));
+        let start = now - Duration::from_secs(7200);
+        for m in 0..120u64 {
+            let wiggle = if m % 2 == 0 { 0.02 } else { -0.02 };
+            channel.on_price(
+                100.0 + 0.01 * m as f64 + wiggle,
+                start + Duration::from_secs(60 * m),
+            );
+        }
+        channel.on_price(last, now);
+        mm.channel = Some(channel);
+        mm.inventory.position = d(position);
+        mm.track_holding(now);
+        mm.hold_skew(now + Duration::from_secs(seconds))
+    }
+
+    #[test]
+    fn near_the_bottom_a_long_is_held_and_a_short_cut() {
+        // A dip to the lower edge: hold a long (half the skew), cut a short (1.5x).
+        assert_eq!(hold_skew_at(101.17, "1", 60), d("0.5"));
+        assert_eq!(hold_skew_at(101.17, "-1", 60), d("1.5"));
+        // Near the top it's the other way round.
+        assert_eq!(hold_skew_at(101.23, "-1", 60), d("0.5"));
+        assert_eq!(hold_skew_at(101.23, "1", 60), d("1.5"));
+        // On the line, or flat: normal skew.
+        assert_eq!(hold_skew_at(101.2, "1", 60), d("1"));
+        assert_eq!(hold_skew_at(101.17, "0", 60), d("1"));
+    }
+
+    #[test]
+    fn holding_stops_after_the_channels_own_return_time() {
+        // This channel has no measured return time, so a quarter of its
+        // two hours: 30 minutes. After that, back to the normal skew.
+        assert_eq!(hold_skew_at(101.17, "1", 29 * 60), d("0.5"));
+        assert_eq!(hold_skew_at(101.17, "1", 31 * 60), d("1"));
+    }
+
+    #[test]
+    fn a_broken_channel_holds_nothing() {
+        assert_eq!(hold_skew_at(100.5, "1", 60), d("1"));
     }
 
     #[test]
