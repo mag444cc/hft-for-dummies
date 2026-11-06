@@ -368,6 +368,29 @@ mod tests {
     }
 
     #[test]
+    fn order_flow_survives_the_round_trip() {
+        let Event::Flow {
+            market, buy, sell, ..
+        } = round_trip(Event::Flow {
+            market: FlowMarket::Spot,
+            buy: Decimal::new(27, 1),
+            sell: Decimal::ZERO,
+            stamp: Stamp::now(Some(1), Some(1)),
+        })
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (market, buy, sell),
+            (FlowMarket::Spot, Decimal::new(27, 1), Decimal::ZERO)
+        );
+        // The form the scratch CVD recorder's lines are merged in as.
+        let merged = r#"{"kind": "Flow", "market": "perp", "buy": "0.0", "sell": "289.36", "at_us": 1793988062000000, "exchange_us": 1793988062000000}"#;
+        let line: Line = serde_json::from_str(merged).unwrap();
+        assert_eq!(line.at_us(), Some(1_793_988_062_000_000));
+    }
+
+    #[test]
     fn reference_prices_round_trip() {
         let Event::Reference { bid, ask, stamp } = round_trip(Event::Reference {
             bid: d("90.1"),
