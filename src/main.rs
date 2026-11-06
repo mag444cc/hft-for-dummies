@@ -14,6 +14,7 @@ mod config;
 mod events;
 mod executor;
 mod fair_value;
+mod flow;
 mod hyperliquid;
 mod hyperliquid_sign;
 mod indicators;

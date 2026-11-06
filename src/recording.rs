@@ -23,9 +23,9 @@ use tokio::sync::mpsc;
 
 use crate::book::Book;
 use crate::config::{Config, VenueName};
-use crate::events::{Event, Stamp};
+use crate::events::{Event, FlowMarket, Stamp};
 use crate::strategy::Ticks;
-use crate::{binance, bullet, bybit, hyperliquid};
+use crate::{binance, bullet, bybit, flow, hyperliquid};
 
 /// Keep at most one Binance (and one Bybit) price per this long.
 pub const REFERENCE_EVERY: Duration = Duration::from_millis(20);
@@ -54,6 +54,14 @@ pub enum Line {
     Trade {
         price: Decimal,
         size: Decimal,
+        at_us: u64,
+        exchange_us: Option<u64>,
+    },
+    /// Aggressive buying and selling on a reference market (for CVD).
+    Flow {
+        market: FlowMarket,
+        buy: Decimal,
+        sell: Decimal,
         at_us: u64,
         exchange_us: Option<u64>,
     },
@@ -109,6 +117,18 @@ impl Line {
                 at_us: stamp.received_unix_us,
                 exchange_us: stamp.exchange_unix_us,
             },
+            Event::Flow {
+                market,
+                buy,
+                sell,
+                stamp,
+            } => Line::Flow {
+                market: *market,
+                buy: *buy,
+                sell: *sell,
+                at_us: stamp.received_unix_us,
+                exchange_us: stamp.exchange_unix_us,
+            },
             Event::BookLost => Line::BookLost { at_us: unix_us() },
             Event::Reconnecting => Line::Reconnecting { at_us: unix_us() },
             _ => return None,
@@ -122,6 +142,7 @@ impl Line {
             Line::Binance(p) | Line::Bybit(p) => Some(p.at_us),
             Line::Book { at_us, .. }
             | Line::Trade { at_us, .. }
+            | Line::Flow { at_us, .. }
             | Line::BookLost { at_us }
             | Line::Reconnecting { at_us } => Some(*at_us),
         }
@@ -167,6 +188,18 @@ impl Line {
             } => Event::Trade {
                 price: *price,
                 size: *size,
+                stamp: stamp(*at_us, *exchange_us, *exchange_us),
+            },
+            Line::Flow {
+                market,
+                buy,
+                sell,
+                at_us,
+                exchange_us,
+            } => Event::Flow {
+                market: *market,
+                buy: *buy,
+                sell: *sell,
                 stamp: stamp(*at_us, *exchange_us, *exchange_us),
             },
             Line::BookLost { .. } => Event::BookLost,
@@ -221,6 +254,13 @@ pub async fn record(config_path: &Path, out: &Path) -> Result<()> {
     binance::connect(&config.binance_symbol, bus.clone());
     if let Some(symbol) = &config.bybit_symbol {
         bybit::connect(symbol, bus.clone());
+    }
+    if config.cvd_enabled() {
+        flow::connect(
+            &config.binance_symbol,
+            config.cvd_spot_symbol.as_deref(),
+            bus.clone(),
+        );
     }
     {
         let bus = bus.clone();

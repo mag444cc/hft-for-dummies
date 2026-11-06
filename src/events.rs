@@ -29,6 +29,16 @@ pub enum Side {
     Sell,
 }
 
+/// Which market a trade-flow event comes from (see `flow.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowMarket {
+    /// Binance USDT perps.
+    Perp,
+    /// Bybit spot.
+    Spot,
+}
+
 #[derive(Debug)]
 pub enum Event {
     /// Binance's best bid and ask (our price reference).
@@ -53,6 +63,14 @@ pub enum Event {
     Trade {
         price: Decimal,
         size: Decimal,
+        stamp: Stamp,
+    },
+    /// Someone traded aggressively on a reference market: how much was
+    /// bought and sold by the side that crossed the spread (for CVD).
+    Flow {
+        market: FlowMarket,
+        buy: Decimal,
+        sell: Decimal,
         stamp: Stamp,
     },
     /// One of our orders (partly) filled.

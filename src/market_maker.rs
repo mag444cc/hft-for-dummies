@@ -17,8 +17,9 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use crate::book::Book;
 use crate::channel::{self, Channel};
 use crate::config::Config;
-use crate::events::{Event, Fill, Intent, Order, Side};
+use crate::events::{Event, Fill, FlowMarket, Intent, Order, Side};
 use crate::fair_value::{FairValue, NotReady};
+use crate::flow::Cvd;
 use crate::indicators::{self, Candles};
 use crate::inventory::Inventory;
 use crate::momentum::Momentum;
@@ -57,6 +58,9 @@ pub struct MarketMaker {
     macd_candles: Option<Candles>,
     /// The latest MACD turn (+1 up, -1 down) and until when it counts.
     macd_signal: Option<(i32, Instant)>,
+    /// Aggressive buying and selling on Binance perps and Bybit spot (only
+    /// with a CVD lean).
+    cvd: Option<Cvd>,
     /// Since when we've held a position the channel bounce favours, near an
     /// edge (only with `channel_hold`).
     holding_since: Option<Instant>,
@@ -109,6 +113,9 @@ impl MarketMaker {
         let rsi_fast = candles(config.rsi_fast_lean_bps.is_some(), config.rsi_fast_secs);
         let rsi_slow = candles(config.rsi_slow_lean_bps.is_some(), config.rsi_slow_secs);
         let macd_candles = candles(config.macd_lean_bps.is_some(), config.macd_secs);
+        let cvd = config
+            .cvd_enabled()
+            .then(|| Cvd::new(Duration::from_secs(config.cvd_long_secs)));
         let fair = FairValue::new(config.bybit_weight);
         Self {
             config,
@@ -124,6 +131,7 @@ impl MarketMaker {
             rsi_slow,
             macd_candles,
             macd_signal: None,
+            cvd,
             book: None,
             bid: None,
             ask: None,
@@ -201,6 +209,17 @@ impl MarketMaker {
                     self.inventory.mark(mid);
                 }
                 self.book = Some((book.clone(), now));
+            }
+            Event::Flow {
+                market,
+                buy,
+                sell,
+                stamp,
+            } => {
+                if let Some(cvd) = &mut self.cvd {
+                    let (buy, sell) = (buy.to_f64().unwrap_or(0.0), sell.to_f64().unwrap_or(0.0));
+                    cvd.on_flow(*market, buy, sell, stamp.received_at);
+                }
             }
             Event::BookLost => self.book = None,
             Event::Fill(fill) => self.on_fill(fill, now),
@@ -480,12 +499,51 @@ impl MarketMaker {
     /// Fair value shifted the way Binance just went (with `momentum_lean`)
     /// and towards the line of a clean channel (with `channel_lean_bps`).
     fn lean_with_binance(&self, fair: Decimal, now: Instant) -> Decimal {
-        let shift =
-            self.momentum_shift_bps() + self.channel_shift_bps() + self.indicator_shift_bps(now);
+        let shift = self.momentum_shift_bps()
+            + self.channel_shift_bps()
+            + self.indicator_shift_bps(now)
+            + self.cvd_shift_bps(now);
         if shift.is_zero() {
             return fair;
         }
         fair * (Decimal::ONE + shift / Decimal::from(10_000))
+    }
+
+    /// The CVD leans: with (or, for negative settings, against) who has
+    /// been more aggressive over the short and long windows, perps and spot
+    /// together; shrunk when perps and spot disagree (`cvd_divergence`).
+    fn cvd_shift_bps(&self, now: Instant) -> Decimal {
+        let Some(cvd) = &self.cvd else {
+            return Decimal::ZERO;
+        };
+        let both = |secs: u64| -> Option<f64> {
+            let window = Duration::from_secs(secs);
+            let perp = cvd.imbalance(FlowMarket::Perp, window, now);
+            let spot = cvd.imbalance(FlowMarket::Spot, window, now);
+            match (perp, spot) {
+                (Some(p), Some(s)) => Some((p + s) / 2.0),
+                (one, other) => one.or(other),
+            }
+        };
+        let lean = |bps: Option<Decimal>, secs: u64| -> f64 {
+            match (bps.and_then(|b| b.to_f64()), both(secs)) {
+                (Some(b), Some(i)) => b * i,
+                _ => 0.0,
+            }
+        };
+        let mut shift = lean(self.config.cvd_short_lean_bps, self.config.cvd_short_secs)
+            + lean(self.config.cvd_long_lean_bps, self.config.cvd_long_secs);
+        if let Some(shrink) = self.config.cvd_divergence.and_then(|d| d.to_f64()) {
+            let window = Duration::from_secs(self.config.cvd_long_secs);
+            let perp = cvd.imbalance(FlowMarket::Perp, window, now);
+            let spot = cvd.imbalance(FlowMarket::Spot, window, now);
+            if let (Some(p), Some(s)) = (perp, spot)
+                && p * s < 0.0
+            {
+                shift *= 1.0 - shrink;
+            }
+        }
+        Decimal::from_f64(shift).unwrap_or_default().round_dp(4)
     }
 
     /// The RSI and MACD leans (each only when its setting is on).
@@ -1288,6 +1346,62 @@ mod tests {
         assert_eq!(
             mm.indicator_shift_bps(now + Duration::from_secs(61)),
             d("1")
+        );
+    }
+
+    /// CVD set up with `short`/`long` leans; perps and spot as given (buy, sell)
+    /// over the last minute, and for the long window the same plus `earlier`.
+    fn cvd_lean(
+        short: &str,
+        long: &str,
+        divergence: Option<&str>,
+        perp: (f64, f64),
+        spot: (f64, f64),
+    ) -> Decimal {
+        let (mut mm, now) = warmed_up();
+        mm.config.cvd_short_lean_bps = Some(d(short));
+        mm.config.cvd_long_lean_bps = Some(d(long));
+        mm.config.cvd_divergence = divergence.map(d);
+        let mut cvd = Cvd::new(Duration::from_secs(900));
+        cvd.on_flow(
+            FlowMarket::Perp,
+            perp.0,
+            perp.1,
+            now - Duration::from_secs(30),
+        );
+        cvd.on_flow(
+            FlowMarket::Spot,
+            spot.0,
+            spot.1,
+            now - Duration::from_secs(30),
+        );
+        mm.cvd = Some(cvd);
+        mm.cvd_shift_bps(now)
+    }
+
+    #[test]
+    fn leans_with_the_order_flow() {
+        // Perps 3 bought / 1 sold (+0.5), spot all bought (+1): together +0.75.
+        // Short lean 2 and long lean 1 (same trades in both windows): 2.25 bps up.
+        assert_eq!(cvd_lean("2", "1", None, (3.0, 1.0), (1.0, 0.0)), d("2.25"));
+        // A negative setting leans against the flow.
+        assert_eq!(
+            cvd_lean("-2", "-1", None, (3.0, 1.0), (1.0, 0.0)),
+            d("-2.25")
+        );
+    }
+
+    #[test]
+    fn perps_and_spot_disagreeing_shrinks_the_lean() {
+        // Perps buy (+0.5), spot sells (-1): together -0.25; long lean 2: -0.5,
+        // and with divergence 0.5 only half of that.
+        assert_eq!(
+            cvd_lean("0.0001", "2", None, (3.0, 1.0), (0.0, 1.0)).round_dp(2),
+            d("-0.5")
+        );
+        assert_eq!(
+            cvd_lean("0.0001", "2", Some("0.5"), (3.0, 1.0), (0.0, 1.0)).round_dp(2),
+            d("-0.25")
         );
     }
 

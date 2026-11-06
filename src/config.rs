@@ -126,6 +126,28 @@ pub struct Config {
     pub macd_lean_bps: Option<Decimal>,
     #[serde(default = "default_macd_secs")]
     pub macd_secs: u64,
+    /// Order flow (CVD, see `flow.rs`): lean both quotes this many bps
+    /// times who was more aggressive over the last `cvd_short_secs`, from
+    /// -1 (only sellers) to +1 (only buyers). Negative values lean against
+    /// the flow instead. Turns on Binance's perp trade feed. Off when unset.
+    #[serde(default)]
+    pub cvd_short_lean_bps: Option<Decimal>,
+    #[serde(default = "default_cvd_short_secs")]
+    pub cvd_short_secs: u64,
+    /// The same over the last `cvd_long_secs`.
+    #[serde(default)]
+    pub cvd_long_lean_bps: Option<Decimal>,
+    #[serde(default = "default_cvd_long_secs")]
+    pub cvd_long_secs: u64,
+    /// Also follow Bybit spot trades for this symbol (e.g. "SOLUSDT"); the
+    /// CVD leans then use perps and spot together.
+    #[serde(default)]
+    pub cvd_spot_symbol: Option<String>,
+    /// When perps and spot disagree over the long window (say perps buy
+    /// while spot sells: often leverage, which tends to unwind), shrink the
+    /// CVD lean by this fraction (0 to 1). Needs `cvd_spot_symbol`.
+    #[serde(default)]
+    pub cvd_divergence: Option<Decimal>,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -195,6 +217,14 @@ fn default_macd_secs() -> u64 {
     60
 }
 
+fn default_cvd_short_secs() -> u64 {
+    60
+}
+
+fn default_cvd_long_secs() -> u64 {
+    900
+}
+
 /// The exchanges the bot can trade on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -221,6 +251,11 @@ impl Config {
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Whether any CVD lean is on (and so the trade feeds are needed).
+    pub fn cvd_enabled(&self) -> bool {
+        self.cvd_short_lean_bps.is_some() || self.cvd_long_lean_bps.is_some()
     }
 
     fn validate(&self) -> Result<()> {
@@ -299,6 +334,26 @@ impl Config {
             if bps.is_some() && secs < 10 {
                 bail!("{name}_secs must be at least 10");
             }
+        }
+        if [self.cvd_short_lean_bps, self.cvd_long_lean_bps]
+            .iter()
+            .any(|b| b.is_some_and(|b| b.is_zero()))
+        {
+            bail!("a CVD lean of 0 does nothing; leave it out instead");
+        }
+        if self.cvd_enabled()
+            && (self.cvd_short_secs == 0 || self.cvd_long_secs <= self.cvd_short_secs)
+        {
+            bail!("cvd_short_secs must be above 0 and below cvd_long_secs");
+        }
+        if self
+            .cvd_divergence
+            .is_some_and(|d| d <= Decimal::ZERO || d > Decimal::ONE)
+        {
+            bail!("cvd_divergence must be above 0 and at most 1");
+        }
+        if self.cvd_divergence.is_some() && self.cvd_spot_symbol.is_none() {
+            bail!("cvd_divergence needs cvd_spot_symbol (spot to compare with)");
         }
         if self.vol_spread_mult.is_some_and(|m| m <= Decimal::ZERO) {
             bail!("vol_spread_mult must be greater than 0");
@@ -542,6 +597,27 @@ mod tests {
         assert!(config.validate().is_ok());
         config.macd_secs = 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn cvd_leans_are_off_unless_asked_for() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert!(!config.cvd_enabled());
+        assert_eq!((config.cvd_short_secs, config.cvd_long_secs), (60, 900));
+        config.cvd_long_lean_bps = Some(Decimal::NEGATIVE_ONE);
+        assert!(
+            config.cvd_enabled() && config.validate().is_ok(),
+            "leaning against the flow is allowed"
+        );
+        config.cvd_divergence = Some(Decimal::new(5, 1));
+        assert!(config.validate().is_err(), "needs spot");
+        config.cvd_spot_symbol = Some("SOLUSDT".into());
+        assert!(config.validate().is_ok());
+        config.cvd_short_secs = 1000;
+        assert!(
+            config.validate().is_err(),
+            "short must be shorter than long"
+        );
     }
 
     #[test]
