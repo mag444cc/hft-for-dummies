@@ -87,9 +87,16 @@ impl Wallet {
         format!("0x{}", hex::encode(self.key.to_bytes()))
     }
 
-    /// Sign `action` with this `nonce`, for mainnet or testnet.
-    pub fn sign(&self, action: &impl Serialize, nonce: u64, mainnet: bool) -> Result<Signature> {
-        let digest = agent_digest(action_hash(action, nonce)?, mainnet);
+    /// Sign `action` with this `nonce`, for mainnet or testnet, trading
+    /// `sub_account` if given (else the account the wallet is approved for).
+    pub fn sign(
+        &self,
+        action: &impl Serialize,
+        nonce: u64,
+        mainnet: bool,
+        sub_account: Option<&str>,
+    ) -> Result<Signature> {
+        let digest = agent_digest(action_hash(action, nonce, sub_account)?, mainnet);
         let (signature, recovery) = self.key.sign_prehash_recoverable(&digest)?;
         let bytes = signature.to_bytes();
         Ok(Signature {
@@ -100,13 +107,33 @@ impl Wallet {
     }
 }
 
-/// Step 1: msgpack(action) + nonce + "no vault", hashed.
-fn action_hash(action: &impl Serialize, nonce: u64) -> Result<[u8; 32]> {
+/// Step 1: msgpack(action) + nonce + which account it's for, hashed.
+fn action_hash(action: &impl Serialize, nonce: u64, sub_account: Option<&str>) -> Result<[u8; 32]> {
     // `_named` writes structs as maps with field names, as Python's msgpack does.
     let mut data = rmp_serde::to_vec_named(action).context("packing the action")?;
     data.extend(nonce.to_be_bytes());
-    data.push(0); // 0 = we trade our own account, not a vault
+    match sub_account {
+        // 0: the account the API wallet was approved for.
+        None => data.push(0),
+        // 1 and the address: one of its sub-accounts (the SDKs call it a "vault").
+        Some(address) => {
+            data.push(1);
+            data.extend(address_bytes(address)?);
+        }
+    }
     Ok(keccak(&data))
+}
+
+/// "0x" and 40 hex characters, as 20 bytes.
+pub fn address_bytes(address: &str) -> Result<[u8; 20]> {
+    let hex_part = address.strip_prefix("0x").unwrap_or(address);
+    let bytes = hex::decode(hex_part).ok().filter(|b| b.len() == 20);
+    let Some(bytes) = bytes else {
+        bail!("{address:?} isn't an address (0x and 40 hex characters)");
+    };
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// Step 2: the EIP-712 message `Agent { source, connectionId }` that gets signed.
@@ -354,7 +381,7 @@ mod tests {
         // test_phantom_agent_creation_matches_production
         let action = OrderAction::new(vec![eth_order("0.0147", "1670.1", "Ioc", None, 4)]);
         assert_eq!(
-            hex::encode(action_hash(&action, 1677777606040).unwrap()),
+            hex::encode(action_hash(&action, 1677777606040, None).unwrap()),
             "0fcbeda5ae3c4950a548021552a4fea2226858c4453571bf3f24ba017eac2908"
         );
     }
@@ -370,7 +397,7 @@ mod tests {
             1,
         )]);
         assert_eq!(
-            wallet().sign(&action, 0, true).unwrap(),
+            wallet().sign(&action, 0, true, None).unwrap(),
             sig(
                 "0x41ae18e8239a56cacbc5dad94d45d0b747e5da11ad564077fcac71277a946e3",
                 "0x3c61f667e747404fe7eea8f90ab0e76cc12ce60270438b2058324681a00116da",
@@ -378,7 +405,7 @@ mod tests {
             )
         );
         assert_eq!(
-            wallet().sign(&action, 0, false).unwrap(),
+            wallet().sign(&action, 0, false, None).unwrap(),
             sig(
                 "0xeba0664bed2676fc4e5a743bf89e5c7501aa6d870bdb9446e122c9466c5cd16d",
                 "0x7f3e74825c9114bc59086f1eebea2928c190fdfbfde144827cb02b85bbe90988",
@@ -392,7 +419,7 @@ mod tests {
         // test_schedule_cancel_action: without and with a time.
         assert_eq!(
             wallet()
-                .sign(&ScheduleCancelAction::new(None), 0, true)
+                .sign(&ScheduleCancelAction::new(None), 0, true, None)
                 .unwrap(),
             sig(
                 "0x6cdfb286702f5917e76cd9b3b8bf678fcc49aec194c02a73e6d4f16891195df9",
@@ -402,7 +429,7 @@ mod tests {
         );
         assert_eq!(
             wallet()
-                .sign(&ScheduleCancelAction::new(Some(123456789)), 0, false)
+                .sign(&ScheduleCancelAction::new(Some(123456789)), 0, false, None)
                 .unwrap(),
             sig(
                 "0x4e4f2dbd4107c69783e251b7e1057d9f2b9d11cee213441ccfa2be63516dc5bc",
@@ -413,20 +440,54 @@ mod tests {
     }
 
     #[test]
-    fn signs_a_plain_number_like_the_sdk() {
-        // test_l1_action_signing_matches: {"type": "dummy", "num": 1000 * 10^8}
-        #[derive(Serialize)]
-        struct Dummy {
-            #[serde(rename = "type")]
-            kind: &'static str,
-            num: u64,
-        }
-        let action = Dummy {
+    fn signs_for_a_sub_account_like_the_sdk() {
+        // test_l1_action_signing_matches_with_vault
+        let action = dummy();
+        let sub_account = Some("0x1719884eb866cb12b2287399b15f7db5e7d775ea");
+        assert_eq!(
+            wallet().sign(&action, 0, true, sub_account).unwrap(),
+            sig(
+                "0x3c548db75e479f8012acf3000ca3a6b05606bc2ec0c29c50c515066a326239",
+                "0x4d402be7396ce74fbba3795769cda45aec00dc3125a984f2a9f23177b190da2c",
+                28
+            )
+        );
+        assert_eq!(
+            wallet().sign(&action, 0, false, sub_account).unwrap(),
+            sig(
+                "0xe281d2fb5c6e25ca01601f878e4d69c965bb598b88fac58e475dd1f5e56c362b",
+                "0x7ddad27e9a238d045c035bc606349d075d5c5cd00a6cd1da23ab5c39d4ef0f60",
+                27
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_a_bad_sub_account_address() {
+        assert!(wallet().sign(&dummy(), 0, true, Some("0x1234")).is_err());
+    }
+
+    #[derive(Serialize)]
+    struct Dummy {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        num: u64,
+    }
+
+    /// {"type": "dummy", "num": 1000 * 10^8}, as in the SDK's tests.
+    fn dummy() -> Dummy {
+        Dummy {
             kind: "dummy",
             num: 100_000_000_000,
-        };
+        }
+    }
+
+    #[test]
+    fn signs_a_plain_number_like_the_sdk() {
+        // test_l1_action_signing_matches
+        let action = dummy();
         assert_eq!(
-            wallet().sign(&action, 0, true).unwrap(),
+            wallet().sign(&action, 0, true, None).unwrap(),
             sig(
                 "0x53749d5b30552aeb2fca34b530185976545bb22d0b3ce6f62e31be961a59298",
                 "0x755c40ba9bf05223521753995abb2f73ab3229be8ec921f350cb447e384d8ed8",

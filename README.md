@@ -129,6 +129,11 @@ Differences from Bullet, all handled by the bot:
 - Each account gets 10,000 requests, then one more per $1 traded. The configs
   requote at most every 2 seconds, but a long run at these sizes can still use
   them up. The bot then gets refusals; watch the log.
+- Running several coins? Give each bot its own **sub-account**: each has its
+  own 10,000 requests, and they share your account's fee tier. Create them on
+  the app's Sub-Accounts page, move some USDC to each, and set `sub_account`
+  to its address in that coin's config. The same `hyperliquid.key` trades all
+  of them.
 - Prices allow 5 significant figures, so the price step changes with the price
   (0.001 below $100, 0.01 above).
 

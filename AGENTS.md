@@ -54,7 +54,11 @@ appears.
   curl -s $H -H "$J" -d '{"type":"userRole","user":"KEY"}'            # {"role":"agent","data":{"user":ADDR}} once approved
   curl -s $H -H "$J" -d '{"type":"clearinghouseState","user":"ADDR"}' # balance, positions
   curl -s $H -H "$J" -d '{"type":"openOrders","user":"ADDR"}'         # resting orders
+  curl -s $H -H "$J" -d '{"type":"subAccounts","user":"ADDR"}'        # sub-accounts (null if none)
   ```
+
+  With `sub_account` set in a config, `ADDR` for positions and orders is the
+  sub-account's address.
 
   Run these before a live start (warn if there's already a SOL-USD position or
   orders on that market) and after stopping (no orders should remain; any position is the

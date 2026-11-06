@@ -18,6 +18,10 @@
 //! - **Rate limits.** Each account gets 10,000 requests to start with, then one
 //!   more for every $1 it trades. A small bot that requotes a lot runs out, so
 //!   the Hyperliquid configs requote less often.
+//! - **Sub-accounts.** Each sub-account has its own allowance (and they share
+//!   the main account's fee tier), so one bot per sub-account goes further.
+//!   The API wallet approved on the main account trades them too: set
+//!   `sub_account` in the config.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,6 +59,8 @@ pub struct Hyperliquid {
     /// The API wallet that signs, and the account it trades (`None` in dry run).
     wallet: Option<Wallet>,
     account: Option<String>,
+    /// Set when `account` is a sub-account: every request says so.
+    sub_account: Option<String>,
     /// Which prices Hyperliquid accepts on this market.
     pub ticks: Ticks,
     quote_ttl: Duration,
@@ -80,9 +86,28 @@ pub async fn connect(config: &Config, bus: Bus) -> Result<Hyperliquid> {
     } else {
         Some(Wallet::load(&config.key_file)?)
     };
-    let account = match &wallet {
+    let main_account = match &wallet {
         Some(w) => Some(trading_account(&http, &api, &config.network, w.address()).await?),
         None => None,
+    };
+    // Hyperliquid shows addresses in lowercase; compare and sign them that way.
+    let sub_account = config.sub_account.as_ref().map(|a| a.to_lowercase());
+    if let (Some(main), Some(sub)) = (&main_account, &sub_account) {
+        let subs: Value = info(&http, &api, json!({"type": "subAccounts", "user": main}))
+            .await
+            .context("reading your sub-accounts")?;
+        if !is_sub_account(&subs, sub) {
+            bail!(
+                "sub_account {sub} isn't a sub-account of {main}, the account your API wallet \
+                 trades for. Copy its address from the app's Sub-Accounts page."
+            );
+        }
+        tracing::info!(main, sub, "hyperliquid: trading a sub-account");
+    }
+    // The account we trade: the sub-account if there is one.
+    let account = match &sub_account {
+        Some(sub) if main_account.is_some() => Some(sub.clone()),
+        _ => main_account,
     };
 
     let meta: Meta = info(&http, &api, json!({"type": "meta"}))
@@ -163,6 +188,7 @@ pub async fn connect(config: &Config, bus: Bus) -> Result<Hyperliquid> {
         asset: asset as u32,
         wallet,
         account,
+        sub_account,
         ticks,
         quote_ttl: Duration::from_secs(config.quote_ttl_secs),
         last_nonce: 0,
@@ -350,12 +376,13 @@ impl Hyperliquid {
             .wallet
             .as_ref()
             .ok_or_else(|| anyhow!("no key in dry run"))?;
-        let signature = wallet.sign(action, nonce, self.mainnet)?;
+        let sub_account = self.sub_account.as_deref();
+        let signature = wallet.sign(action, nonce, self.mainnet, sub_account)?;
         let body = json!({
             "action": action,
             "nonce": nonce,
             "signature": signature,
-            "vaultAddress": null,
+            "vaultAddress": sub_account,
         });
         let answer: Value = self
             .http
@@ -415,18 +442,28 @@ async fn trading_account(
             );
             Ok(account)
         }
-        Some("user") => bail!(
-            "the key in your key file (address {signer}) is an account's own key. The bot only \
-             trades with an API wallet, which can't withdraw. Make one with \
-             `cargo run -- keygen --venue hyperliquid` and approve it at {app}"
-        ),
+        // Hyperliquid says "user" for any address that isn't an API wallet,
+        // even one it has never seen, so this covers both cases.
         _ => bail!(
             "the key in your key file has address {signer}, and that isn't an approved API wallet.\n  \
              - Made it with keygen? Approve it here (paste the address, then Authorize):\n    {app}\n  \
              - Check network = \"{network}\" matches where you approved it, and that the approval \
-               hasn't expired."
+               hasn't expired.\n  \
+             - Is it your account's own key? The bot won't use that (it could withdraw): \
+               make an API wallet with `cargo run -- keygen --venue hyperliquid`."
         ),
     }
+}
+
+/// Is `sub` in this `subAccounts` answer (a list, or null if there are none)?
+fn is_sub_account(answer: &Value, sub: &str) -> bool {
+    answer.as_array().is_some_and(|subs| {
+        subs.iter().any(|s| {
+            s["subAccountUser"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case(sub))
+        })
+    })
 }
 
 /// The per-order answers in an `/exchange` reply, or the error.
@@ -844,6 +881,29 @@ mod tests {
             (42, Some(7), Side::Sell, d("100.52"), d("0.15"), d("0.0023"))
         );
         assert!(user_events(&live, "BTC").is_empty(), "another coin");
+    }
+
+    #[test]
+    fn finds_our_sub_account() {
+        let subs = parse(
+            r#"[{"name":"sol-bot","subAccountUser":"0x035605fc2f24d65300227189025e90a0d947f16c","master":"0x8c967e73e7b15087c42a10d344cff4c96d877f1d"}]"#,
+        );
+        assert!(is_sub_account(
+            &subs,
+            "0x035605fc2f24d65300227189025e90a0d947f16c"
+        ));
+        assert!(is_sub_account(
+            &subs,
+            "0x035605FC2F24D65300227189025E90A0D947F16C"
+        ));
+        assert!(!is_sub_account(
+            &subs,
+            "0x1719884eb866cb12b2287399b15f7db5e7d775ea"
+        ));
+        assert!(!is_sub_account(
+            &parse("null"),
+            "0x035605fc2f24d65300227189025e90a0d947f16c"
+        ));
     }
 
     #[test]

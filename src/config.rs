@@ -23,6 +23,11 @@ pub struct Config {
     pub dry_run: bool,
     /// Key file made by `cargo run -- keygen`. Only needed when `dry_run = false`.
     pub key_file: PathBuf,
+    /// Hyperliquid only: trade this sub-account of your account (its address,
+    /// from the app's Sub-Accounts page) instead of the main one. Each
+    /// sub-account has its own request allowance.
+    #[serde(default)]
+    pub sub_account: Option<String>,
 
     /// The market we quote: on Bullet e.g. "SOL-USD", on Hyperliquid the coin, e.g. "SOL".
     pub symbol: String,
@@ -115,6 +120,13 @@ impl Config {
                 self.order_size,
                 self.max_position
             );
+        }
+        if let Some(sub_account) = &self.sub_account {
+            if self.venue != VenueName::Hyperliquid {
+                bail!("sub_account only works on Hyperliquid");
+            }
+            crate::hyperliquid_sign::address_bytes(sub_account)
+                .context("sub_account must be the sub-account's address")?;
         }
         // Hyperliquid's dead man's switch can't be set less than 5s ahead.
         if self.venue == VenueName::Hyperliquid && self.quote_ttl_secs < 10 {
@@ -215,6 +227,22 @@ mod tests {
         assert_eq!(
             Config::load(Path::new("bot.toml")).unwrap().venue,
             VenueName::Bullet
+        );
+    }
+
+    #[test]
+    fn a_sub_account_must_be_an_address_on_hyperliquid() {
+        let mut config = Config::load(Path::new("configs/hyperliquid-sol.toml")).unwrap();
+        config.sub_account = Some("0x1719884eb866cb12b2287399b15f7db5e7d775ea".into());
+        assert!(config.validate().is_ok());
+        config.sub_account = Some("my sub account".into());
+        assert!(config.validate().is_err(), "not an address");
+
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        config.sub_account = Some("0x1719884eb866cb12b2287399b15f7db5e7d775ea".into());
+        assert!(
+            config.validate().is_err(),
+            "Bullet has no sub-accounts here"
         );
     }
 

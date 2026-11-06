@@ -9,6 +9,7 @@ network = "mainnet"
 # true: watch the market and log the quotes we WOULD place. No key, no money.
 dry_run = true
 key_file = "hyperliquid.key"  # cargo run -- keygen --venue hyperliquid
+# sub_account = "0x..."       # trade a sub-account instead (its own request allowance)
 
 # Quote BTC on Hyperliquid, using Binance's BTC perp as the price reference.
 symbol = "BTC"
