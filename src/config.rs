@@ -150,14 +150,17 @@ pub struct Config {
     pub cvd_divergence: Option<Decimal>,
     /// When spot is clearly buying (or selling) over the long window while
     /// perps are flat, lean this many extra bps with spot: real buyers taking
-    /// coins, not leverage, tend to make steadier moves. Needs
+    /// coins, not leverage, tend to make steadier moves. Negative leans
+    /// against spot instead (over 12 months of Binance data spot-led flow was
+    /// slightly more often followed by a move the other way). Needs
     /// `cvd_spot_symbol`. Off when unset.
     #[serde(default)]
     pub cvd_spot_lead_bps: Option<Decimal>,
     /// When spot and perps are both clearly buying (or both selling) over
-    /// the long window, lean this many bps that way: meant to be smaller
-    /// than `cvd_spot_lead_bps`, since a move everyone joins is more often
-    /// late. Needs `cvd_spot_symbol`. Off when unset.
+    /// the long window, lean this many bps that way. Negative leans against
+    /// them instead: over 12 months of Binance data, flow everyone joined was
+    /// followed by a move the other way 52-56% of the time (the clearest CVD
+    /// signal). Needs `cvd_spot_symbol`. Off when unset.
     #[serde(default)]
     pub cvd_agree_bps: Option<Decimal>,
     /// The most all the fair-value leans together (momentum, channel, RSI,
@@ -376,8 +379,8 @@ impl Config {
         if self.cvd_divergence.is_some() && self.cvd_spot_symbol.is_none() {
             bail!("cvd_divergence needs cvd_spot_symbol (spot to compare with)");
         }
-        if self.cvd_spot_lead_bps.is_some_and(|b| b <= Decimal::ZERO) {
-            bail!("cvd_spot_lead_bps must be greater than 0");
+        if self.cvd_spot_lead_bps.is_some_and(|b| b.is_zero()) {
+            bail!("a cvd_spot_lead_bps of 0 does nothing; leave it out instead");
         }
         if self.cvd_spot_lead_bps.is_some() && self.cvd_spot_symbol.is_none() {
             bail!("cvd_spot_lead_bps needs cvd_spot_symbol (the spot trades it follows)");
@@ -385,8 +388,8 @@ impl Config {
         if self.max_total_lean_bps.is_some_and(|b| b <= Decimal::ZERO) {
             bail!("max_total_lean_bps must be greater than 0");
         }
-        if self.cvd_agree_bps.is_some_and(|b| b <= Decimal::ZERO) {
-            bail!("cvd_agree_bps must be greater than 0");
+        if self.cvd_agree_bps.is_some_and(|b| b.is_zero()) {
+            bail!("a cvd_agree_bps of 0 does nothing; leave it out instead");
         }
         if self.cvd_agree_bps.is_some() && self.cvd_spot_symbol.is_none() {
             bail!("cvd_agree_bps needs cvd_spot_symbol (spot to agree with)");

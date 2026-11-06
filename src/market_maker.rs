@@ -1493,6 +1493,17 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_agree_lean_leans_against_the_crowd() {
+        let (mut mm, now) = warmed_up();
+        mm.config.cvd_agree_bps = Some(d("-0.5"));
+        let mut cvd = Cvd::new(Duration::from_secs(900));
+        cvd.on_flow(FlowMarket::Perp, 3.0, 1.0, now - Duration::from_secs(30));
+        cvd.on_flow(FlowMarket::Spot, 3.0, 1.0, now - Duration::from_secs(30));
+        mm.cvd = Some(cvd);
+        assert_eq!(mm.cvd_shift_bps(now), d("-0.5"), "both buying: lean down");
+    }
+
+    #[test]
     fn spot_and_perps_buying_together_lean_up_a_little() {
         assert_eq!(agree((3.0, 1.0), (3.0, 1.0)), d("0.5"), "both +0.5");
         assert_eq!(agree((1.0, 3.0), (1.0, 3.0)), d("-0.5"), "both selling");
