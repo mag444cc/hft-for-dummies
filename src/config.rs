@@ -105,6 +105,27 @@ pub struct Config {
     /// Needs `channel_lean_bps`. Off when unset.
     #[serde(default)]
     pub channel_hold: Option<Decimal>,
+    /// When Binance's RSI on `rsi_fast_secs` candles is above 70
+    /// (overbought), lean both quotes this many bps down: quick run-ups
+    /// tended to fade over the next half hour. Off when unset.
+    #[serde(default)]
+    pub rsi_fast_lean_bps: Option<Decimal>,
+    #[serde(default = "default_rsi_fast_secs")]
+    pub rsi_fast_secs: u64,
+    /// When Binance's RSI on `rsi_slow_secs` candles is below 30
+    /// (oversold), lean both quotes this many bps up: hourly oversold
+    /// markets tended to recover over the next hours. Off when unset.
+    #[serde(default)]
+    pub rsi_slow_lean_bps: Option<Decimal>,
+    #[serde(default = "default_rsi_slow_secs")]
+    pub rsi_slow_secs: u64,
+    /// For six `macd_secs` candles after Binance's MACD turns (down from
+    /// well above zero, or up from well below), lean both quotes this many
+    /// bps that way. Off when unset.
+    #[serde(default)]
+    pub macd_lean_bps: Option<Decimal>,
+    #[serde(default = "default_macd_secs")]
+    pub macd_secs: u64,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -160,6 +181,18 @@ fn default_channel_secs() -> u64 {
 
 fn default_channel_fit() -> f64 {
     0.7
+}
+
+fn default_rsi_fast_secs() -> u64 {
+    300
+}
+
+fn default_rsi_slow_secs() -> u64 {
+    3600
+}
+
+fn default_macd_secs() -> u64 {
+    60
 }
 
 /// The exchanges the bot can trade on.
@@ -254,6 +287,18 @@ impl Config {
         }
         if !(0.0..1.0).contains(&self.channel_fit) {
             bail!("channel_fit must be at least 0 and below 1");
+        }
+        for (name, bps, secs) in [
+            ("rsi_fast", self.rsi_fast_lean_bps, self.rsi_fast_secs),
+            ("rsi_slow", self.rsi_slow_lean_bps, self.rsi_slow_secs),
+            ("macd", self.macd_lean_bps, self.macd_secs),
+        ] {
+            if bps.is_some_and(|b| b <= Decimal::ZERO) {
+                bail!("{name}_lean_bps must be greater than 0");
+            }
+            if bps.is_some() && secs < 10 {
+                bail!("{name}_secs must be at least 10");
+            }
         }
         if self.vol_spread_mult.is_some_and(|m| m <= Decimal::ZERO) {
             bail!("vol_spread_mult must be greater than 0");
@@ -473,6 +518,29 @@ mod tests {
         assert!(config.validate().is_err());
         config.channel_secs = 7200;
         config.channel_fit = 1.5;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn indicator_leans_are_off_unless_asked_for() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(
+            (
+                config.rsi_fast_lean_bps,
+                config.rsi_slow_lean_bps,
+                config.macd_lean_bps
+            ),
+            (None, None, None)
+        );
+        assert_eq!(
+            (config.rsi_fast_secs, config.rsi_slow_secs, config.macd_secs),
+            (300, 3600, 60)
+        );
+        config.macd_lean_bps = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.macd_lean_bps = Some(Decimal::ONE);
+        assert!(config.validate().is_ok());
+        config.macd_secs = 1;
         assert!(config.validate().is_err());
     }
 

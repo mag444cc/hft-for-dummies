@@ -16,6 +16,7 @@ mod executor;
 mod fair_value;
 mod hyperliquid;
 mod hyperliquid_sign;
+mod indicators;
 mod inventory;
 mod key;
 mod liveness;

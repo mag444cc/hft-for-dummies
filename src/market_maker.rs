@@ -19,6 +19,7 @@ use crate::channel::{self, Channel};
 use crate::config::Config;
 use crate::events::{Event, Fill, Intent, Order, Side};
 use crate::fair_value::{FairValue, NotReady};
+use crate::indicators::{self, Candles};
 use crate::inventory::Inventory;
 use crate::momentum::Momentum;
 use crate::strategy::{self, Adjust, Quotes, Ticks};
@@ -29,6 +30,9 @@ const MAX_MOMENTUM_LEAN_BPS: Decimal = Decimal::TEN;
 
 /// How much Binance history the volatility spread looks at.
 const VOL_WINDOW: Duration = Duration::from_secs(60);
+
+/// MACD only counts as "well above/below zero" past this fraction of the price.
+const MACD_THRESHOLD: f64 = 0.0003;
 
 /// How often to check our fills against the exchange's record.
 const FILL_CHECK_EVERY: Duration = Duration::from_secs(10);
@@ -46,6 +50,13 @@ pub struct MarketMaker {
     channel: Option<Channel>,
     /// Binance's move over `big_move_secs` (only with `big_move_bps`).
     big_move: Option<Momentum>,
+    /// Candles of Binance's price for the indicator leans (each only when
+    /// its setting is on).
+    rsi_fast: Option<Candles>,
+    rsi_slow: Option<Candles>,
+    macd_candles: Option<Candles>,
+    /// The latest MACD turn (+1 up, -1 down) and until when it counts.
+    macd_signal: Option<(i32, Instant)>,
     /// Since when we've held a position the channel bounce favours, near an
     /// edge (only with `channel_hold`).
     holding_since: Option<Instant>,
@@ -93,6 +104,11 @@ impl MarketMaker {
         let channel = config
             .channel_lean_bps
             .map(|_| Channel::new(Duration::from_secs(config.channel_secs)));
+        let candles =
+            |on: bool, secs: u64| on.then(|| Candles::new(Duration::from_secs(secs), 120));
+        let rsi_fast = candles(config.rsi_fast_lean_bps.is_some(), config.rsi_fast_secs);
+        let rsi_slow = candles(config.rsi_slow_lean_bps.is_some(), config.rsi_slow_secs);
+        let macd_candles = candles(config.macd_lean_bps.is_some(), config.macd_secs);
         let fair = FairValue::new(config.bybit_weight);
         Self {
             config,
@@ -104,6 +120,10 @@ impl MarketMaker {
             channel,
             recent_fills: VecDeque::new(),
             holding_since: None,
+            rsi_fast,
+            rsi_slow,
+            macd_candles,
+            macd_signal: None,
             book: None,
             bid: None,
             ask: None,
@@ -152,6 +172,22 @@ impl MarketMaker {
                 }
                 if let Some(channel) = &mut self.channel {
                     channel.on_price(mid.to_f64().unwrap_or(0.0), stamp.received_at);
+                }
+                let price = mid.to_f64().unwrap_or(0.0);
+                for candles in [&mut self.rsi_fast, &mut self.rsi_slow]
+                    .into_iter()
+                    .flatten()
+                {
+                    candles.on_price(price, stamp.received_at);
+                }
+                if let Some(candles) = &mut self.macd_candles
+                    && candles.on_price(price, stamp.received_at)
+                {
+                    let turn = indicators::macd_turn(candles.closes(), MACD_THRESHOLD);
+                    if turn != 0 {
+                        let lasts = Duration::from_secs(self.config.macd_secs * 6);
+                        self.macd_signal = Some((turn, stamp.received_at + lasts));
+                    }
                 }
                 self.track_holding(now);
             }
@@ -323,7 +359,7 @@ impl MarketMaker {
         match self.fair.get(now, self.reference_stale()) {
             Ok(fair) => (
                 strategy::quote_adjusted(
-                    self.lean_with_binance(fair),
+                    self.lean_with_binance(fair, now),
                     self.inventory.position,
                     &self.config,
                     book,
@@ -443,12 +479,35 @@ impl MarketMaker {
 
     /// Fair value shifted the way Binance just went (with `momentum_lean`)
     /// and towards the line of a clean channel (with `channel_lean_bps`).
-    fn lean_with_binance(&self, fair: Decimal) -> Decimal {
-        let shift = self.momentum_shift_bps() + self.channel_shift_bps();
+    fn lean_with_binance(&self, fair: Decimal, now: Instant) -> Decimal {
+        let shift =
+            self.momentum_shift_bps() + self.channel_shift_bps() + self.indicator_shift_bps(now);
         if shift.is_zero() {
             return fair;
         }
         fair * (Decimal::ONE + shift / Decimal::from(10_000))
+    }
+
+    /// The RSI and MACD leans (each only when its setting is on).
+    fn indicator_shift_bps(&self, now: Instant) -> Decimal {
+        let mut shift = Decimal::ZERO;
+        let rsi_of = |c: &Option<Candles>| c.as_ref().and_then(|c| indicators::rsi(c.closes(), 14));
+        if let Some(bps) = self.config.rsi_fast_lean_bps
+            && rsi_of(&self.rsi_fast).is_some_and(|r| r > 70.0)
+        {
+            shift -= bps; // overbought: quick run-ups tended to fade
+        }
+        if let Some(bps) = self.config.rsi_slow_lean_bps
+            && rsi_of(&self.rsi_slow).is_some_and(|r| r < 30.0)
+        {
+            shift += bps; // oversold on the slow candles: tended to recover
+        }
+        if let (Some(bps), Some((turn, until))) = (self.config.macd_lean_bps, self.macd_signal)
+            && now < until
+        {
+            shift += bps * Decimal::from(turn);
+        }
+        shift
     }
 
     fn momentum_shift_bps(&self) -> Decimal {
@@ -1197,6 +1256,39 @@ mod tests {
     #[test]
     fn a_broken_channel_holds_nothing() {
         assert_eq!(hold_skew_at(100.5, "1", 60), d("1"));
+    }
+
+    #[test]
+    fn indicator_leans_follow_rsi_and_macd() {
+        let (mut mm, now) = warmed_up();
+        mm.config.rsi_fast_lean_bps = Some(d("1"));
+        mm.config.rsi_slow_lean_bps = Some(d("2"));
+        mm.config.macd_lean_bps = Some(d("0.5"));
+        assert_eq!(mm.indicator_shift_bps(now), Decimal::ZERO, "no candles yet");
+        // Twenty fast candles, all up: RSI 100, overbought: lean down 1.
+        let mut fast = Candles::new(Duration::from_secs(300), 120);
+        let start = now - Duration::from_secs(300 * 21);
+        for i in 0..=21u64 {
+            fast.on_price(100.0 + i as f64, start + Duration::from_secs(300 * i));
+        }
+        mm.rsi_fast = Some(fast);
+        assert_eq!(mm.indicator_shift_bps(now), d("-1"));
+        // Twenty slow candles, all down: oversold, lean up 2; together +1.
+        let mut slow = Candles::new(Duration::from_secs(3600), 120);
+        let start = now - Duration::from_secs(3600 * 21);
+        for i in 0..=21u64 {
+            slow.on_price(100.0 - i as f64, start + Duration::from_secs(3600 * i));
+        }
+        mm.rsi_slow = Some(slow);
+        assert_eq!(mm.indicator_shift_bps(now), d("1"));
+        // A MACD turn down, still in force: another half bps down.
+        mm.macd_signal = Some((-1, now + Duration::from_secs(60)));
+        assert_eq!(mm.indicator_shift_bps(now), d("0.5"));
+        // ...and once it has run out, gone again.
+        assert_eq!(
+            mm.indicator_shift_bps(now + Duration::from_secs(61)),
+            d("1")
+        );
     }
 
     #[test]
