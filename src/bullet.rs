@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bullet_rust_sdk::codegen::types::Filter;
-use bullet_rust_sdk::types::{OrderUpdateData, OrderUpdateMessage};
+use bullet_rust_sdk::types::{AggTradeMessage, OrderUpdateData, OrderUpdateMessage};
 use bullet_rust_sdk::{
     Client, ClientOrderId, Keypair, ManagedWsConfig, MarketId, Network, NewOrderArgs, OrderIdKind,
     OrderType, OrderbookDepth, PositiveDecimal, ServerMessage, Side as BulletSide, Topic,
@@ -90,39 +90,50 @@ pub async fn connect(config: &Config, bus: Bus) -> Result<Bullet> {
     }
     tracing::info!(symbol = %config.symbol, %tick, %step, %min_size, account = ?account, "bullet: connected");
 
-    // Two connections: the order book on one, our own orders and fills on
-    // the other. A flood of book updates can't delay news of a fill, and if
-    // one connection drops the other carries on.
+    // Two connections: the market (order book and everyone's trades) on
+    // one, our own orders and fills on the other. A flood of book updates
+    // can't delay news of a fill, and if one connection drops the other
+    // carries on. Other people's trades are for dry run's paper fills.
     let symbol = config.symbol.clone();
     let mut book = BookKeeper::default();
-    let book_topic = Topic::depth(config.symbol.as_str(), OrderbookDepth::D20);
-    spawn_socket(&client, book_topic, bus.clone(), move |event| match event {
-        WsEvent::Message(msg) => match *msg {
-            ServerMessage::DepthUpdate(depth) if depth.symbol == symbol => {
-                match book.on_message(&depth) {
-                    BookEvent::Updated(book) => Some(Event::Book(
-                        book,
-                        Stamp::now(Some(depth.event_time), Some(depth.transaction_time)),
-                    )),
-                    BookEvent::Lost => Some(Event::BookLost),
-                    BookEvent::None => None,
+    let mut trades = Trades::default();
+    let market_topics = vec![
+        Topic::depth(config.symbol.as_str(), OrderbookDepth::D20),
+        Topic::agg_trade(config.symbol.as_str()),
+    ];
+    spawn_socket(
+        &client,
+        market_topics,
+        bus.clone(),
+        move |event| match event {
+            WsEvent::Message(msg) => match *msg {
+                ServerMessage::AggTrade(trade) if trade.symbol == symbol => trades.on_trade(&trade),
+                ServerMessage::DepthUpdate(depth) if depth.symbol == symbol => {
+                    match book.on_message(&depth) {
+                        BookEvent::Updated(book) => Some(Event::Book(
+                            book,
+                            Stamp::now(Some(depth.event_time), Some(depth.transaction_time)),
+                        )),
+                        BookEvent::Lost => Some(Event::BookLost),
+                        BookEvent::None => None,
+                    }
                 }
+                _ => None,
+            },
+            WsEvent::Reconnecting => {
+                book.reset();
+                Some(Event::Reconnecting)
             }
-            _ => None,
+            WsEvent::Disconnected(why) => Some(Event::Disconnected(why)),
         },
-        WsEvent::Reconnecting => {
-            book.reset();
-            Some(Event::Reconnecting)
-        }
-        WsEvent::Disconnected(why) => Some(Event::Disconnected(why)),
-    })
+    )
     .await?;
 
     if let Some(account) = &account {
         let symbol = config.symbol.clone();
         spawn_socket(
             &client,
-            Topic::user_orders(account.clone()),
+            vec![Topic::user_orders(account.clone())],
             bus,
             move |event| match event {
                 WsEvent::Message(msg) => match *msg {
@@ -268,11 +279,11 @@ fn new_order_args(o: &Order) -> Result<NewOrderArgs> {
 /// anything means it's dead: reconnect.
 const DEAD_AFTER: Duration = Duration::from_secs(3);
 
-/// Open one websocket subscribed to `topic`, and send what `handle` makes of
+/// Open one websocket subscribed to `topics`, and send what `handle` makes of
 /// each message to `bus`. The SDK reconnects (and resubscribes) by itself.
 async fn spawn_socket(
     client: &Client,
-    topic: Topic,
+    topics: Vec<Topic>,
     bus: Bus,
     mut handle: impl FnMut(WsEvent) -> Option<Event> + Send + 'static,
 ) -> Result<()> {
@@ -283,7 +294,7 @@ async fn spawn_socket(
         .call()
         .await
         .context("opening Bullet websocket")?;
-    ws.subscribe(vec![topic], None).context("subscribing")?;
+    ws.subscribe(topics, None).context("subscribing")?;
     tokio::spawn(async move {
         let mut ping = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -382,6 +393,40 @@ fn parse_user_trades(body: &str) -> Result<Vec<Fill>> {
             })
         })
         .collect()
+}
+
+/// Other people's trades, each once: Bullet sometimes sends the same trade
+/// twice, and counting it twice would make paper orders fill too easily.
+#[derive(Default)]
+struct Trades {
+    last_id: Option<u64>,
+}
+
+impl Trades {
+    fn on_trade(&mut self, trade: &AggTradeMessage) -> Option<Event> {
+        if self.last_id.is_some_and(|last| trade.agg_trade_id <= last) {
+            return None;
+        }
+        self.last_id = Some(trade.agg_trade_id);
+        trade_event(trade)
+    }
+}
+
+/// Someone traded on the market (anyone): for dry run's paper fills.
+fn trade_event(trade: &AggTradeMessage) -> Option<Event> {
+    let (Ok(price), Ok(size)) = (
+        Decimal::from_str(&trade.price),
+        Decimal::from_str(&trade.quantity),
+    ) else {
+        tracing::warn!("bullet: unreadable trade {trade:?}");
+        return None;
+    };
+    Some(Event::Trade {
+        price,
+        size,
+        // Bullet's times are µs since 1970.
+        stamp: Stamp::now(Some(trade.event_time), Some(trade.trade_time)),
+    })
 }
 
 /// Turn one of our order updates into an [`Event`].
@@ -495,6 +540,39 @@ mod tests {
             (Decimal::new(10052, 2), Decimal::new(5, 2))
         );
         assert!(!f.order_finished);
+    }
+
+    /// A real trade message from mainnet (SOL-USD, 2026-11-06), with this id.
+    fn trade(id: u64) -> AggTradeMessage {
+        let msg = format!(
+            r#"{{"e":"aggTrade","E":1793965214165129,"s":"SOL-USD","a":{id},"p":"90.348","q":"0.01","f":{id},"l":{id},"T":1793965214161547,"m":true,"th":"0xd8a48cde4dab41926847bc757d3110915e4b24c0211c4d853c38c26a6a2139e8","ua":"","oi":0,"mk":false,"ff":false,"lq":false,"fe":"0","nf":"0","fa":"","co":0,"sd":"","ft":"","z":"0","Z":"0","rs":"0"}}"#
+        );
+        let ServerMessage::AggTrade(trade) = serde_json::from_str(&msg).unwrap() else {
+            panic!("not a trade")
+        };
+        trade
+    }
+
+    #[test]
+    fn reads_other_peoples_trades() {
+        let Some(Event::Trade { price, size, stamp }) = trade_event(&trade(24914118)) else {
+            panic!()
+        };
+        assert_eq!((price, size), (Decimal::new(90348, 3), Decimal::new(1, 2)));
+        assert_eq!(
+            stamp.exchange_unix_us,
+            Some(1_793_965_214_165_129),
+            "Bullet's times are µs"
+        );
+    }
+
+    #[test]
+    fn counts_each_trade_once() {
+        // Bullet sent this very trade twice in a row.
+        let mut trades = Trades::default();
+        assert!(trades.on_trade(&trade(24914118)).is_some());
+        assert!(trades.on_trade(&trade(24914118)).is_none(), "the repeat");
+        assert!(trades.on_trade(&trade(24914119)).is_some(), "the next one");
     }
 
     #[test]
