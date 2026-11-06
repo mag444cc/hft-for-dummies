@@ -152,7 +152,7 @@ async fn event_loop(
             market_maker.on_event(&event, Instant::now());
         }
     }
-    market_maker.log_summary();
+    market_maker.log_summary(Instant::now());
     tracing::info!("latency this run:\n{}", telemetry.table());
     tracing::info!("{}", telemetry.scoreboard());
     result

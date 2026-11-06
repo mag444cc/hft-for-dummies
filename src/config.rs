@@ -104,7 +104,7 @@ fn default_momentum_ms() -> u64 {
 }
 
 /// The exchanges the bot can trade on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VenueName {
     #[default]

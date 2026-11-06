@@ -3,6 +3,7 @@
 //! Start reading at `events.rs` (the vocabulary), then `bot.rs` (the loop),
 //! `market_maker.rs` (the decisions) and `strategy.rs` (the prices).
 
+mod backtest;
 mod binance;
 mod book;
 mod bot;
@@ -19,6 +20,7 @@ mod key;
 mod liveness;
 mod market_maker;
 mod momentum;
+mod recording;
 mod strategy;
 mod telemetry;
 mod volatility;
@@ -46,6 +48,18 @@ enum Command {
         #[arg(default_value = "bot.toml")]
         config: PathBuf,
     },
+    /// Record the market a config quotes (no trading), to replay with `backtest`.
+    Record {
+        config: PathBuf,
+        /// The file to write, e.g. recordings/sol.jsonl.
+        out: PathBuf,
+    },
+    /// Replay a recording through configs (files or folders) and compare them.
+    Backtest {
+        recording: PathBuf,
+        #[arg(required = true)]
+        configs: Vec<PathBuf>,
+    },
     /// Make a new trading key for the bot, to approve in the exchange's app.
     Keygen {
         /// Where to write it (default: bot.key for Bullet, hyperliquid.key for Hyperliquid).
@@ -60,19 +74,24 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // A backtest replays thousands of bots' worth of log lines: only errors.
+    let quiet = matches!(cli.command, Some(Command::Backtest { .. }));
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| if quiet { "error" } else { "info" }.into()),
         )
         // Colours only in a terminal, not in a server's log files.
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
-    let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Run {
         config: "bot.toml".into(),
     }) {
         Command::Run { config } => bot::run(&config, cli.live).await,
+        Command::Record { config, out } => recording::record(&config, &out).await,
+        Command::Backtest { recording, configs } => backtest::backtest(&recording, &configs),
         Command::Keygen {
             path,
             network,

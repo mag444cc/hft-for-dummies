@@ -52,6 +52,9 @@ pub struct MarketMaker {
     last_fill_check: Option<Instant>,
     /// Set when something means we must not quote again this run, and why.
     stopped: Option<&'static str>,
+    /// Fills counted, and what they earned against fair value at the time.
+    trades: u64,
+    spread_profit: Decimal,
     /// Why we are (or aren't) quoting; logged when it changes.
     status: &'static str,
 }
@@ -90,6 +93,8 @@ impl MarketMaker {
             last_summary: None,
             last_fill_check: None,
             stopped: None,
+            trades: 0,
+            spread_profit: Decimal::ZERO,
             status: "",
         }
     }
@@ -133,7 +138,7 @@ impl MarketMaker {
                 self.book = Some((book.clone(), now));
             }
             Event::BookLost => self.book = None,
-            Event::Fill(fill) => self.on_fill(fill),
+            Event::Fill(fill) => self.on_fill(fill, now),
             Event::OrderGone { client_id } => self.forget(*client_id),
             Event::PlaceFailed { client_ids } => client_ids.iter().for_each(|id| self.forget(*id)),
             Event::CancelFailed => {
@@ -173,7 +178,7 @@ impl MarketMaker {
                     .last_summary
                     .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10))
                 {
-                    self.log_summary();
+                    self.log_summary(now);
                     self.last_summary = Some(now);
                 }
                 if self
@@ -307,9 +312,18 @@ impl MarketMaker {
         }
     }
 
-    fn on_fill(&mut self, fill: &Fill) {
+    fn on_fill(&mut self, fill: &Fill, now: Instant) {
         if !self.inventory.on_fill(fill) {
             return;
+        }
+        // What this fill earned against fair value right now: the spread part
+        // of our profit (the rest is what the position did afterwards).
+        self.trades += 1;
+        if let Ok(fair) = self.fair.get(now, self.reference_stale()) {
+            self.spread_profit += match fill.side {
+                Side::Buy => (fair - fill.price) * fill.size,
+                Side::Sell => (fill.price - fair) * fill.size,
+            };
         }
         if fill.order_finished
             && let Some(id) = fill.client_id
@@ -406,8 +420,20 @@ impl MarketMaker {
         jumpy.map_or(self.config.spread_bps, |j| j.max(self.config.spread_bps))
     }
 
-    pub fn log_summary(&self) {
-        let fair = self.fair.get(Instant::now(), self.reference_stale()).ok();
+    /// How this run went so far (for the backtester).
+    pub fn results(&self) -> Results {
+        Results {
+            trades: self.trades,
+            spread_profit: self.spread_profit,
+            fees: self.inventory.fees,
+            position: self.inventory.position,
+            after_fees: self.pnl(),
+            stopped: self.stopped.is_some(),
+        }
+    }
+
+    pub fn log_summary(&self, now: Instant) {
+        let fair = self.fair.get(now, self.reference_stale()).ok();
         tracing::info!(
             "mid {} | fair {} | our bid {} ask {} | position {} | pnl ${} (fees ${})",
             show(self.mid()),
@@ -422,6 +448,20 @@ impl MarketMaker {
             tracing::info!("spread now {} bps", self.spread_bps().round_dp(2));
         }
     }
+}
+
+/// How a run went: see [`MarketMaker::results`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Results {
+    pub trades: u64,
+    /// What the fills earned against fair value when they happened.
+    pub spread_profit: Decimal,
+    pub fees: Decimal,
+    pub position: Decimal,
+    /// Profit after fees, valuing the position at the mid (None: no mid yet).
+    pub after_fees: Option<Decimal>,
+    /// The loss limit (or a too-big position) stopped quoting.
+    pub stopped: bool,
 }
 
 /// A number, or "-" when we don't have one yet.
@@ -671,6 +711,30 @@ mod tests {
             quotes_after_binance_moves("0", Some("0.5")),
             quotes_after_binance_moves("0", None)
         );
+    }
+
+    #[test]
+    fn counts_trades_and_the_spread_each_one_earned() {
+        let (mut mm, now) = warmed_up();
+        mm.requote(now);
+        // Fair value is 100. A buy at 99.90 earned 0.10 x 2 = 0.20 against it.
+        let fill = Fill {
+            trade_id: 1,
+            client_id: None,
+            side: Side::Buy,
+            price: d("99.90"),
+            size: d("2"),
+            fee: d("0.01"),
+            order_finished: false,
+        };
+        mm.on_event(&Event::Fill(fill.clone()), now);
+        mm.on_event(&Event::Fill(fill), now); // the same fill again: not counted twice
+        let r = mm.results();
+        assert_eq!(
+            (r.trades, r.spread_profit, r.fees),
+            (1, d("0.20"), d("0.01"))
+        );
+        assert_eq!(r.position, d("2"));
     }
 
     #[test]

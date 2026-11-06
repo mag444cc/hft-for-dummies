@@ -20,7 +20,7 @@ use crate::config::Config;
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 
 /// Which prices an exchange accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Ticks {
     /// Any multiple of this step, at every price (Bullet: 0.01 on SOL-USD).
     Fixed(Decimal),

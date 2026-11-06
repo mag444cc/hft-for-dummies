@@ -247,6 +247,9 @@ pub struct PaperExecutor {
     next_trade_id: u64,
     /// Fee per fill, as a fraction of its value (bps / 10,000).
     fee_rate: Decimal,
+    /// The time by the market's own events (µs since 1970): the wall clock
+    /// when live, the recording's time in a replay.
+    clock_us: u64,
 }
 
 struct PaperOrder {
@@ -267,6 +270,7 @@ impl PaperExecutor {
             bus,
             next_trade_id: 0,
             fee_rate: fee_bps / Decimal::from(10_000),
+            clock_us: 0,
         }
     }
 
@@ -279,7 +283,12 @@ impl PaperExecutor {
             order,
             left: order.size,
             ahead,
-            placed_unix_us: unix_us(),
+            // Before any event has set the clock, the wall clock will do.
+            placed_unix_us: if self.clock_us > 0 {
+                self.clock_us
+            } else {
+                unix_us()
+            },
         });
     }
 
@@ -340,6 +349,14 @@ impl Executor for PaperExecutor {
     }
 
     fn on_event(&mut self, event: &Event) {
+        // Keep time by the events, so a replay of an old recording works too.
+        if let Event::Book(_, stamp)
+        | Event::Trade { stamp, .. }
+        | Event::Reference { stamp, .. }
+        | Event::SecondReference { stamp, .. } = event
+        {
+            self.clock_us = self.clock_us.max(stamp.received_unix_us);
+        }
         match event {
             Event::Book(book, _) => {
                 let (best_bid, best_ask) = (book.best_bid(), book.best_ask());
@@ -541,6 +558,30 @@ mod tests {
             stamp: old,
         });
         assert!(fills(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn paper_keeps_time_by_the_events_in_a_replay() {
+        // A replay of an hour ago: the book and trade are stamped then, not now.
+        let (bus, mut events) = mpsc::unbounded_channel();
+        let mut paper = PaperExecutor::new(bus, Decimal::ZERO);
+        let hour_ago = unix_us() - 3_600_000_000;
+        let mut stamp = Stamp::at(Instant::now());
+        stamp.received_unix_us = hour_ago;
+        paper.on_event(&Event::Book(
+            Book::from_levels(&[(d("99"), d("1"))], &[(d("101"), d("1"))]),
+            stamp,
+        ));
+        paper.execute(vec![Intent::Place(bid(7, "100", "1"))]);
+        // A trade through our price a second later (an hour ago, too): it filled us.
+        let mut later = stamp;
+        later.exchange_unix_us = Some(hour_ago + 1_000_000);
+        paper.on_event(&Event::Trade {
+            price: d("99.5"),
+            size: d("1"),
+            stamp: later,
+        });
+        assert_eq!(fills(&mut events), vec![(Some(7), d("1"), true)]);
     }
 
     #[tokio::test]
