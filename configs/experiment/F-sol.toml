@@ -1,0 +1,25 @@
+# Experiment setup F, SOL on Hyperliquid: dry run only.
+# Spread 2 bps, requote at most every 400 ms, no urgent requotes.
+# See configs/experiment/README.md. Started by `./infra/bot/deploy.sh experiment`.
+
+venue = "hyperliquid"
+network = "mainnet"
+dry_run = true
+key_file = "hyperliquid.key"
+
+symbol = "SOL"
+binance_symbol = "SOLUSDT"
+
+spread_bps = "2"
+order_size = "0.15"
+max_position = "0.3"
+skew_bps = "1"
+requote_threshold_bps = "0.5"
+min_requote_ms = 400
+quote_ttl_secs = 30
+
+paper_fee_bps = "1.5"               # charge Hyperliquid's base maker fee on paper fills
+max_loss_usd = "5"
+reference_stale_secs = 5
+book_stale_secs = 10
+basis_halflife_secs = 300

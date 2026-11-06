@@ -89,6 +89,10 @@ terminal each; each config has its own metrics port. At startup the bot checks
 the market exists and the order size is allowed there (Hyperliquid: at least
 $10 an order), and says what to change if not.
 
+To compare settings, [`configs/experiment/`](configs/experiment/) has 42
+dry-run bots (14 spread and requote setups on SOL, ETH and BTC) that run
+together on the Tokyo server: `./infra/bot/deploy.sh experiment 8`.
+
 A config picks its exchange with `venue = "bullet"` (the default) or
 `venue = "hyperliquid"`. On Hyperliquid, `symbol` is the coin (`"ETH"`), not
 `"ETH-USD"`.
