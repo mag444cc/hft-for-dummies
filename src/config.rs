@@ -33,6 +33,13 @@ pub struct Config {
     pub symbol: String,
     /// The Binance USD-M perp we borrow the price from, e.g. "SOLUSDT".
     pub binance_symbol: String,
+    /// Also borrow the price from this Bybit USDT perp, e.g. "SOLUSDT":
+    /// blended into fair value, and a fallback if Binance goes quiet. Off when unset.
+    #[serde(default)]
+    pub bybit_symbol: Option<String>,
+    /// Bybit's share of fair value when both prices are fresh (0 to 1).
+    #[serde(default = "default_bybit_weight")]
+    pub bybit_weight: Decimal,
 
     /// Distance of each quote from fair value, in basis points (1 bp = 0.01%).
     pub spread_bps: Decimal,
@@ -86,6 +93,10 @@ pub struct Config {
     /// (`infra/grafana`). Off when unset.
     #[serde(default)]
     pub metrics_port: Option<u16>,
+}
+
+fn default_bybit_weight() -> Decimal {
+    Decimal::new(3, 1)
 }
 
 fn default_momentum_ms() -> u64 {
@@ -142,6 +153,12 @@ impl Config {
             && urgent <= Decimal::ZERO
         {
             bail!("urgent_requote_bps must be greater than 0, got {urgent}");
+        }
+        if self.bybit_weight < Decimal::ZERO || self.bybit_weight > Decimal::ONE {
+            bail!(
+                "bybit_weight must be between 0 and 1, got {}",
+                self.bybit_weight
+            );
         }
         if self.momentum_lean.is_some_and(|m| m <= Decimal::ZERO) {
             bail!("momentum_lean must be greater than 0");
@@ -298,6 +315,17 @@ mod tests {
         assert!(config.validate().is_err());
         config.urgent_requote_bps = Some(Decimal::ONE);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn bybit_is_off_unless_asked_for() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(config.bybit_symbol, None);
+        assert_eq!(config.bybit_weight, Decimal::new(3, 1), "30% when it is on");
+        config.bybit_weight = Decimal::new(11, 1);
+        assert!(config.validate().is_err(), "more than 100%");
+        config.bybit_weight = Decimal::NEGATIVE_ONE;
+        assert!(config.validate().is_err());
     }
 
     #[test]

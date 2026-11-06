@@ -72,10 +72,11 @@ impl MarketMaker {
         let momentum = config
             .momentum_lean
             .map(|_| Momentum::new(Duration::from_millis(config.momentum_ms)));
+        let fair = FairValue::new(config.bybit_weight);
         Self {
             config,
             ticks,
-            fair: FairValue::default(),
+            fair,
             volatility,
             momentum,
             book: None,
@@ -120,14 +121,13 @@ impl MarketMaker {
                     momentum.on_price(mid, stamp.received_at);
                 }
             }
+            Event::SecondReference { bid, ask, stamp } => {
+                self.fair.on_bybit(*bid, *ask, stamp.received_at)
+            }
             Event::Book(book, _) => {
                 if let Some(mid) = book.mid() {
-                    self.fair.on_bullet_mid(
-                        mid,
-                        now,
-                        self.reference_stale(),
-                        self.basis_halflife(),
-                    );
+                    self.fair
+                        .on_venue_mid(mid, now, self.reference_stale(), self.basis_halflife());
                     self.inventory.mark(mid);
                 }
                 self.book = Some((book.clone(), now));
@@ -298,8 +298,8 @@ impl MarketMaker {
                 ),
                 "quoting",
             ),
-            Err(NotReady::NoBinancePrice) => (none, "waiting for Binance"),
-            Err(NotReady::BinanceStale) => (none, "Binance price is stale, not quoting"),
+            Err(NotReady::NoPrice) => (none, "waiting for Binance"),
+            Err(NotReady::Stale) => (none, "Binance price is stale, not quoting"),
             Err(NotReady::WarmingUp) => (
                 none,
                 "learning the price gap to Binance (takes about a minute)",

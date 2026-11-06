@@ -7,6 +7,7 @@ mod binance;
 mod book;
 mod bot;
 mod bullet;
+mod bybit;
 mod config;
 mod events;
 mod executor;

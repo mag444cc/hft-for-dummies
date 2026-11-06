@@ -37,6 +37,13 @@ pub enum Event {
         ask: Decimal,
         stamp: Stamp,
     },
+    /// Bybit's best bid and ask: a second price reference, blended into
+    /// fair value (and used alone if Binance goes quiet).
+    SecondReference {
+        bid: Decimal,
+        ask: Decimal,
+        stamp: Stamp,
+    },
     /// The exchange's order book changed.
     Book(Book, Stamp),
     /// Our copy of the order book is out of sync; don't trust it.

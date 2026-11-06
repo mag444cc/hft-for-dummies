@@ -1,7 +1,7 @@
 //! The harness: wires the pieces together and runs the loop.
 //!
 //! ```text
-//!  Binance feed ──┐                                  ┌── LiveExecutor ──> Bullet or Hyperliquid
+//!  Binance, Bybit ┐                                  ┌── LiveExecutor ──> Bullet or Hyperliquid
 //!  exchange feed ─┼──> bus ──> MarketMaker ──> intents
 //!  timer, Ctrl-C ─┘     ^       (state machine)      └── PaperExecutor (dry run)
 //!                       └──────── fills, acks, failures ──────┘
@@ -23,7 +23,7 @@ use crate::executor::{Executor, LiveExecutor, PaperExecutor, Venue};
 use crate::market_maker::MarketMaker;
 use crate::strategy::Ticks;
 use crate::telemetry::{self, Telemetry};
-use crate::{binance, bullet, hyperliquid};
+use crate::{binance, bullet, bybit, hyperliquid};
 
 pub async fn run(config_path: &Path, live: bool) -> Result<()> {
     let config = Config::load(config_path)?.live(live);
@@ -70,6 +70,9 @@ async fn trade(
     events: mpsc::UnboundedReceiver<Event>,
 ) -> Result<()> {
     binance::connect(&config.binance_symbol, bus.clone());
+    if let Some(symbol) = &config.bybit_symbol {
+        bybit::connect(symbol, bus.clone());
+    }
     spawn_timer(bus.clone());
     spawn_ctrl_c(bus.clone());
 
