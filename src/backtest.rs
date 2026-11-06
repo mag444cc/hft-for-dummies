@@ -7,8 +7,12 @@
 //! comparison is fair, and an hour of market replays in seconds.
 //!
 //! Like a dry run it is kind to us in one way: our orders never move the
-//! market, and they arrive and leave instantly.
+//! market. By default they also arrive and leave instantly; `--latency-ms`
+//! makes every order, change and cancel take that long to reach the
+//! exchange, as it would in real life (a quote that's being cancelled can
+//! still be hit in the meantime).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -32,6 +36,10 @@ struct Run {
     fills: mpsc::UnboundedReceiver<Event>,
     /// Orders placed, moved or cancelled: what would count against a rate limit.
     requests: u64,
+    /// How long our requests take to reach the exchange.
+    latency: Duration,
+    /// Requests on their way, and when they arrive.
+    in_flight: VecDeque<(Instant, Vec<Intent>)>,
 }
 
 /// How one config did.
@@ -43,7 +51,7 @@ pub struct Report {
 }
 
 impl Run {
-    fn new(name: String, config: Config, ticks: Ticks) -> Self {
+    fn new(name: String, config: Config, ticks: Ticks, latency: Duration) -> Self {
         let (bus, fills) = mpsc::unbounded_channel();
         let fee = config.paper_fee_bps.unwrap_or_default();
         let mut run = Self {
@@ -52,13 +60,36 @@ impl Run {
             paper: PaperExecutor::new(bus, fee),
             fills,
             requests: 0,
+            latency,
+            in_flight: VecDeque::new(),
         };
+        // Startup (clearing old orders) happens before the replay starts.
         let start = run.market_maker.start();
-        run.execute(start);
+        run.count(&start);
+        run.paper.execute(start);
         run
     }
 
-    fn execute(&mut self, intents: Vec<Intent>) {
+    /// Send `intents` at `now`: they reach the exchange `latency` later.
+    fn execute(&mut self, intents: Vec<Intent>, now: Instant) {
+        self.count(&intents);
+        if self.latency.is_zero() {
+            self.paper.execute(intents);
+        } else if !intents.is_empty() {
+            self.in_flight.push_back((now + self.latency, intents));
+        }
+    }
+
+    /// Requests that have reached the exchange by `now` take effect.
+    fn arrive(&mut self, now: Instant) {
+        while self.in_flight.front().is_some_and(|(at, _)| *at <= now) {
+            if let Some((_, intents)) = self.in_flight.pop_front() {
+                self.paper.execute(intents);
+            }
+        }
+    }
+
+    fn count(&mut self, intents: &[Intent]) {
         self.requests += intents
             .iter()
             .filter(|i| {
@@ -68,21 +99,21 @@ impl Run {
                 )
             })
             .count() as u64;
-        self.paper.execute(intents);
     }
 
     /// The same steps as the bot's loop, for one event at `now`.
     fn on_event(&mut self, event: &Event, now: Instant) {
+        self.arrive(now);
         self.paper.on_event(event);
         let intents = self.market_maker.on_event(event, now);
-        self.execute(intents);
+        self.execute(intents, now);
         // Fills the paper executor just made, before the next event.
         while let Ok(fill) = self.fills.try_recv() {
             let intents = self.market_maker.on_event(&fill, now);
-            self.execute(intents);
+            self.execute(intents, now);
         }
         let intents = self.market_maker.requote(now);
-        self.execute(intents);
+        self.execute(intents, now);
     }
 }
 
@@ -92,10 +123,11 @@ pub fn replay(
     ticks: Ticks,
     lines: impl Iterator<Item = Line>,
     configs: Vec<(String, Config)>,
+    latency: Duration,
 ) -> (Vec<Report>, Duration) {
     let mut runs: Vec<Run> = configs
         .into_iter()
-        .map(|(name, config)| Run::new(name, config, ticks))
+        .map(|(name, config)| Run::new(name, config, ticks, latency))
         .collect();
     // The replay's clock: the first event is "now", the rest follow at their
     // recorded distance from it.
@@ -136,7 +168,7 @@ pub fn replay(
 
 /// `cargo run -- backtest`: replay a recording through every config given
 /// (files, or folders of `.toml` files) and print the comparison.
-pub fn backtest(recording_path: &Path, config_paths: &[PathBuf]) -> Result<()> {
+pub fn backtest(recording_path: &Path, config_paths: &[PathBuf], latency: Duration) -> Result<()> {
     let (header, lines) = recording::read(recording_path)?;
     let Line::Header { symbol, ticks, .. } = &header else {
         bail!("no header")
@@ -178,7 +210,7 @@ pub fn backtest(recording_path: &Path, config_paths: &[PathBuf]) -> Result<()> {
         .collect::<Result<Vec<Line>>>()
         .context("reading the recording")?;
     let count = lines.len();
-    let (mut reports, covered) = replay(*ticks, lines.into_iter(), configs);
+    let (mut reports, covered) = replay(*ticks, lines.into_iter(), configs, latency);
     println!(
         "{symbol}: {count} events covering {:.1} hours, replayed through {} configs in {:.1} s\n",
         covered.as_secs_f64() / 3600.0,
@@ -277,6 +309,7 @@ mod tests {
             Ticks::Fixed(d("0.01")),
             market().into_iter(),
             vec![("ten".into(), config("10"))],
+            Duration::ZERO,
         );
         let r = &reports[0].results;
         assert_eq!((r.trades, r.position), (1, d("1")));
@@ -300,9 +333,31 @@ mod tests {
                 ("ten".into(), config("10")),
                 ("thirty".into(), config("30")),
             ],
+            Duration::ZERO,
         );
         assert_eq!(reports[0].results.trades, 1);
         assert_eq!(reports[1].results.trades, 0);
+    }
+
+    #[test]
+    fn a_slow_order_can_miss_the_trade() {
+        // We first quote once warmed up, about 60 s in; the sale at 99.80 is
+        // at 70 s. Instantly (or nearly) our bid is there for it; with a 15 s
+        // delay it only lands at about 75 s, after the sale.
+        let (fast, _) = replay(
+            Ticks::Fixed(d("0.01")),
+            market().into_iter(),
+            vec![("ten".into(), config("10"))],
+            Duration::from_millis(1),
+        );
+        assert_eq!(fast[0].results.trades, 1, "a 1 ms delay changes nothing");
+        let (slow, _) = replay(
+            Ticks::Fixed(d("0.01")),
+            market().into_iter(),
+            vec![("ten".into(), config("10"))],
+            Duration::from_secs(15),
+        );
+        assert_eq!(slow[0].results.trades, 0, "the bid wasn't there yet");
     }
 
     #[test]
@@ -311,6 +366,7 @@ mod tests {
             Ticks::Fixed(d("0.01")),
             market().into_iter(),
             vec![("ten".into(), config("10"))],
+            Duration::ZERO,
         );
         let table = table(&reports, covered);
         assert!(table.contains("ten"), "{table}");

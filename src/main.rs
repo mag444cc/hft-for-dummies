@@ -62,6 +62,10 @@ enum Command {
         recording: PathBuf,
         #[arg(required = true)]
         configs: Vec<PathBuf>,
+        /// How long our orders, changes and cancels take to reach the
+        /// exchange (0 = instantly). Try what the bot really sees, e.g. 150.
+        #[arg(long, default_value_t = 0)]
+        latency_ms: u64,
     },
     /// Make a new trading key for the bot, to approve in the exchange's app.
     Keygen {
@@ -94,7 +98,15 @@ async fn main() -> Result<()> {
     }) {
         Command::Run { config } => bot::run(&config, cli.live).await,
         Command::Record { config, out } => recording::record(&config, &out).await,
-        Command::Backtest { recording, configs } => backtest::backtest(&recording, &configs),
+        Command::Backtest {
+            recording,
+            configs,
+            latency_ms,
+        } => backtest::backtest(
+            &recording,
+            &configs,
+            std::time::Duration::from_millis(latency_ms),
+        ),
         Command::Keygen {
             path,
             network,
