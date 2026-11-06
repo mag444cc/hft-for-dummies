@@ -154,6 +154,12 @@ pub struct Config {
     /// `cvd_spot_symbol`. Off when unset.
     #[serde(default)]
     pub cvd_spot_lead_bps: Option<Decimal>,
+    /// When spot and perps are both clearly buying (or both selling) over
+    /// the long window, lean this many bps that way: meant to be smaller
+    /// than `cvd_spot_lead_bps`, since a move everyone joins is more often
+    /// late. Needs `cvd_spot_symbol`. Off when unset.
+    #[serde(default)]
+    pub cvd_agree_bps: Option<Decimal>,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -264,6 +270,7 @@ impl Config {
         self.cvd_short_lean_bps.is_some()
             || self.cvd_long_lean_bps.is_some()
             || self.cvd_spot_lead_bps.is_some()
+            || self.cvd_agree_bps.is_some()
     }
 
     fn validate(&self) -> Result<()> {
@@ -368,6 +375,12 @@ impl Config {
         }
         if self.cvd_spot_lead_bps.is_some() && self.cvd_spot_symbol.is_none() {
             bail!("cvd_spot_lead_bps needs cvd_spot_symbol (the spot trades it follows)");
+        }
+        if self.cvd_agree_bps.is_some_and(|b| b <= Decimal::ZERO) {
+            bail!("cvd_agree_bps must be greater than 0");
+        }
+        if self.cvd_agree_bps.is_some() && self.cvd_spot_symbol.is_none() {
+            bail!("cvd_agree_bps needs cvd_spot_symbol (spot to agree with)");
         }
         if self.vol_spread_mult.is_some_and(|m| m <= Decimal::ZERO) {
             bail!("vol_spread_mult must be greater than 0");

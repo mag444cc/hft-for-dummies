@@ -36,6 +36,8 @@ const VOL_WINDOW: Duration = Duration::from_secs(60);
 /// lopsided over the long window, while perps are within `PERPS_FLAT` of even.
 const SPOT_LEADS: f64 = 0.3;
 const PERPS_FLAT: f64 = 0.15;
+/// Spot and perps "both clearly" buying or selling (`cvd_agree_bps`).
+const BOTH_CLEAR: f64 = 0.15;
 
 /// MACD only counts as "well above/below zero" past this fraction of the price.
 const MACD_THRESHOLD: f64 = 0.0003;
@@ -556,6 +558,18 @@ impl MarketMaker {
                 && perp.abs() < PERPS_FLAT
             {
                 shift += lead * spot.signum();
+            }
+        }
+        if let Some(agree) = self.config.cvd_agree_bps.and_then(|b| b.to_f64()) {
+            let window = Duration::from_secs(self.config.cvd_long_secs);
+            let perp = cvd.imbalance(FlowMarket::Perp, window, now);
+            let spot = cvd.imbalance(FlowMarket::Spot, window, now);
+            if let (Some(p), Some(s)) = (perp, spot)
+                && p * s > 0.0
+                && p.abs() >= BOTH_CLEAR
+                && s.abs() >= BOTH_CLEAR
+            {
+                shift += agree * s.signum();
             }
         }
         Decimal::from_f64(shift).unwrap_or_default().round_dp(4)
@@ -1425,6 +1439,39 @@ mod tests {
         );
         mm.cvd = Some(cvd);
         mm.cvd_shift_bps(now)
+    }
+
+    /// Only the agree lean (0.5 bps), with perps and spot as given.
+    fn agree(perp: (f64, f64), spot: (f64, f64)) -> Decimal {
+        let (mut mm, now) = warmed_up();
+        mm.config.cvd_agree_bps = Some(d("0.5"));
+        let mut cvd = Cvd::new(Duration::from_secs(900));
+        cvd.on_flow(
+            FlowMarket::Perp,
+            perp.0,
+            perp.1,
+            now - Duration::from_secs(30),
+        );
+        cvd.on_flow(
+            FlowMarket::Spot,
+            spot.0,
+            spot.1,
+            now - Duration::from_secs(30),
+        );
+        mm.cvd = Some(cvd);
+        mm.cvd_shift_bps(now)
+    }
+
+    #[test]
+    fn spot_and_perps_buying_together_lean_up_a_little() {
+        assert_eq!(agree((3.0, 1.0), (3.0, 1.0)), d("0.5"), "both +0.5");
+        assert_eq!(agree((1.0, 3.0), (1.0, 3.0)), d("-0.5"), "both selling");
+        assert_eq!(
+            agree((3.0, 1.0), (1.0, 3.0)),
+            Decimal::ZERO,
+            "they disagree"
+        );
+        assert_eq!(agree((10.0, 10.0), (3.0, 1.0)), Decimal::ZERO, "perps flat");
     }
 
     #[test]
