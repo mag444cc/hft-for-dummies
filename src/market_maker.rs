@@ -506,10 +506,13 @@ impl MarketMaker {
     /// Fair value shifted the way Binance just went (with `momentum_lean`)
     /// and towards the line of a clean channel (with `channel_lean_bps`).
     fn lean_with_binance(&self, fair: Decimal, now: Instant) -> Decimal {
-        let shift = self.momentum_shift_bps()
+        let mut shift = self.momentum_shift_bps()
             + self.channel_shift_bps()
             + self.indicator_shift_bps(now)
             + self.cvd_shift_bps(now);
+        if let Some(cap) = self.config.max_total_lean_bps {
+            shift = shift.clamp(-cap, cap);
+        }
         if shift.is_zero() {
             return fair;
         }
@@ -1460,6 +1463,33 @@ mod tests {
         );
         mm.cvd = Some(cvd);
         mm.cvd_shift_bps(now)
+    }
+
+    #[test]
+    fn the_total_lean_can_be_capped() {
+        let (mut mm, now) = warmed_up();
+        // Two leans pointing the same way: RSI overbought (-1) and a MACD turn down (-2).
+        mm.config.rsi_fast_lean_bps = Some(d("1"));
+        mm.config.macd_lean_bps = Some(d("2"));
+        let mut fast = Candles::new(Duration::from_secs(300), 120);
+        let start = now - Duration::from_secs(300 * 21);
+        for i in 0..=21u64 {
+            fast.on_price(100.0 + i as f64, start + Duration::from_secs(300 * i));
+        }
+        mm.rsi_fast = Some(fast);
+        mm.macd_signal = Some((-1, now + Duration::from_secs(60)));
+        let fair = d("100");
+        assert_eq!(
+            mm.lean_with_binance(fair, now),
+            d("99.97"),
+            "-3 bps uncapped"
+        );
+        mm.config.max_total_lean_bps = Some(d("2"));
+        assert_eq!(
+            mm.lean_with_binance(fair, now),
+            d("99.98"),
+            "capped at -2 bps"
+        );
     }
 
     #[test]

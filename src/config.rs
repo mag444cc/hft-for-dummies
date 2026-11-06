@@ -160,6 +160,12 @@ pub struct Config {
     /// late. Needs `cvd_spot_symbol`. Off when unset.
     #[serde(default)]
     pub cvd_agree_bps: Option<Decimal>,
+    /// The most all the fair-value leans together (momentum, channel, RSI,
+    /// MACD, CVD) may shift fair value, either way, in bps: when many point
+    /// the same way they add up, and past the spread the bot would be betting
+    /// on direction rather than making a market. No limit when unset.
+    #[serde(default)]
+    pub max_total_lean_bps: Option<Decimal>,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -375,6 +381,9 @@ impl Config {
         }
         if self.cvd_spot_lead_bps.is_some() && self.cvd_spot_symbol.is_none() {
             bail!("cvd_spot_lead_bps needs cvd_spot_symbol (the spot trades it follows)");
+        }
+        if self.max_total_lean_bps.is_some_and(|b| b <= Decimal::ZERO) {
+            bail!("max_total_lean_bps must be greater than 0");
         }
         if self.cvd_agree_bps.is_some_and(|b| b <= Decimal::ZERO) {
             bail!("cvd_agree_bps must be greater than 0");
