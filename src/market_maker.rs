@@ -172,19 +172,20 @@ impl MarketMaker {
         // Rate-limit replacing quotes, but never delay pulling them.
         let pulling = wanted.bid.is_none() && wanted.ask.is_none();
         let min_gap = Duration::from_millis(self.config.min_requote_ms);
-        if !pulling
+        let waiting = !pulling
             && self
                 .last_requote
-                .is_some_and(|t| now.duration_since(t) < min_gap)
-        {
-            return Vec::new();
-        }
+                .is_some_and(|t| now.duration_since(t) < min_gap);
 
         // Replace a quote at half its lifetime, long before it expires.
         let refresh_after = Duration::from_secs(self.config.quote_ttl_secs) / 2;
         let mut intents = Vec::new();
         for (side, want) in [(Side::Buy, wanted.bid), (Side::Sell, wanted.ask)] {
             let resting = *self.slot(side);
+            // While we wait out the gap, only a quote in the market's way moves.
+            if waiting && !self.in_the_way(side, resting, want) {
+                continue;
+            }
             let young = self
                 .since(side)
                 .is_some_and(|t| now.duration_since(t) < refresh_after);
@@ -223,6 +224,22 @@ impl MarketMaker {
             self.last_requote = Some(now);
         }
         intents
+    }
+
+    /// Has fair value (Binance) moved towards this resting order by at least
+    /// `urgent_requote_bps`? Then the market is about to trade with a price we
+    /// no longer want: a sell left too cheap, or a buy left too dear.
+    fn in_the_way(&self, side: Side, resting: Option<Order>, want: Option<Decimal>) -> bool {
+        let (Some(urgent), Some(order), Some(price)) =
+            (self.config.urgent_requote_bps, resting, want)
+        else {
+            return false;
+        };
+        let towards = match side {
+            Side::Buy => order.price > price,  // we'd now bid lower
+            Side::Sell => order.price < price, // we'd now ask higher
+        };
+        towards && drift_bps(order.price, price) >= urgent
     }
 
     fn wanted_quotes(&self, now: Instant) -> (Quotes, &'static str) {
@@ -410,6 +427,71 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Binance's best bid and ask moved to these, `after` from `start`.
+    fn binance(mm: &mut MarketMaker, bid: &str, ask: &str, at: Instant) {
+        let event = Event::Reference {
+            bid: d(bid),
+            ask: d(ask),
+            stamp: Stamp::at(at),
+        };
+        mm.on_event(&event, at);
+    }
+
+    /// Warmed up, quoting 99.90 / 100.10, and just requoted: the next
+    /// ordinary requote has to wait 2 s.
+    fn quoting_with_urgent(urgent: Option<&str>) -> (MarketMaker, Instant) {
+        let (mut mm, now) = warmed_up();
+        mm.config.min_requote_ms = 2000;
+        mm.config.urgent_requote_bps = urgent.map(d);
+        assert_eq!(
+            places(&mm.requote(now)),
+            vec![(Side::Buy, d("99.90")), (Side::Sell, d("100.10"))]
+        );
+        (mm, now)
+    }
+
+    #[test]
+    fn a_binance_jump_up_moves_our_ask_at_once() {
+        let (mut mm, now) = quoting_with_urgent(Some("5"));
+        // Binance up 10 bps, 0.1 s after we quoted: our ask at 100.10 is now cheap.
+        let soon = now + Duration::from_millis(100);
+        binance(&mut mm, "99.6", "100.6", soon);
+        assert_eq!(
+            places(&mm.requote(soon)),
+            vec![(Side::Sell, d("100.21"))],
+            "only the side in the way moves; the bid can wait"
+        );
+    }
+
+    #[test]
+    fn a_binance_jump_down_moves_our_bid_at_once() {
+        let (mut mm, now) = quoting_with_urgent(Some("5"));
+        let soon = now + Duration::from_millis(100);
+        binance(&mut mm, "99.4", "100.4", soon);
+        assert_eq!(places(&mm.requote(soon)), vec![(Side::Buy, d("99.80"))]);
+    }
+
+    #[test]
+    fn a_small_move_still_waits_for_the_requote_gap() {
+        let (mut mm, now) = quoting_with_urgent(Some("5"));
+        // Up 3 bps: past the 5 bps requote threshold? No. Urgent? No.
+        let soon = now + Duration::from_millis(100);
+        binance(&mut mm, "99.53", "100.53", soon);
+        assert!(mm.requote(soon).is_empty());
+    }
+
+    #[test]
+    fn without_urgent_requotes_a_jump_waits_too() {
+        let (mut mm, now) = quoting_with_urgent(None);
+        let soon = now + Duration::from_millis(100);
+        binance(&mut mm, "99.6", "100.6", soon);
+        assert!(mm.requote(soon).is_empty(), "the old behaviour");
+        // Once the gap has passed, both sides move.
+        let later = now + Duration::from_millis(2000);
+        binance(&mut mm, "99.6", "100.6", later);
+        assert_eq!(places(&mm.requote(later)).len(), 2);
     }
 
     #[test]

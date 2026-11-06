@@ -44,8 +44,13 @@ pub struct Config {
     pub skew_bps: Decimal,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
-    /// And never more often than this.
+    /// And never more often than this...
     pub min_requote_ms: u64,
+    /// ...unless fair value (which follows Binance) has moved this far (bps)
+    /// *towards* one of our orders: then move that order at once, before
+    /// the market reaches it. Off when unset.
+    #[serde(default)]
+    pub urgent_requote_bps: Option<Decimal>,
     /// Every order we place expires after this long, so if the bot dies its
     /// quotes stop being fillable. The bot refreshes them at half this age.
     pub quote_ttl_secs: u64,
@@ -110,6 +115,11 @@ impl Config {
             if value <= Decimal::ZERO {
                 bail!("{name} must be greater than 0, got {value}");
             }
+        }
+        if let Some(urgent) = self.urgent_requote_bps
+            && urgent <= Decimal::ZERO
+        {
+            bail!("urgent_requote_bps must be greater than 0, got {urgent}");
         }
         if self.skew_bps < Decimal::ZERO {
             bail!("skew_bps can't be negative, got {}", self.skew_bps);
@@ -244,6 +254,16 @@ mod tests {
             config.validate().is_err(),
             "Bullet has no sub-accounts here"
         );
+    }
+
+    #[test]
+    fn urgent_requotes_need_a_positive_threshold() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(config.urgent_requote_bps, None, "off unless asked for");
+        config.urgent_requote_bps = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.urgent_requote_bps = Some(Decimal::ONE);
+        assert!(config.validate().is_ok());
     }
 
     #[test]

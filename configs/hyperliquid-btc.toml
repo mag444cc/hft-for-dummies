@@ -21,7 +21,8 @@ order_size = "0.0002"         # BTC per order. Hyperliquid refuses orders under 
 max_position = "0.0004"       # never hold more than this, long or short
 skew_bps = "5"                # at max position, lean both quotes 0.05% to unwind
 requote_threshold_bps = "5"   # replace a quote once it is this far (bps) off where we want it
-min_requote_ms = 2000         # but at most this often
+min_requote_ms = 2000         # but at most this often,
+urgent_requote_bps = "5"      # unless Binance moves 0.05% towards an order: then move it at once
 #   Hyperliquid allows 10,000 requests, then 1 more per $1 traded: requote sparingly.
 quote_ttl_secs = 30           # if the bot dies, Hyperliquid cancels our orders 30s later (dead man's switch)
 
