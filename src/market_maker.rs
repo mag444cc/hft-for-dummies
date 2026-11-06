@@ -12,8 +12,10 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 use crate::book::Book;
+use crate::channel::{self, Channel};
 use crate::config::Config;
 use crate::events::{Event, Fill, Intent, Order, Side};
 use crate::fair_value::{FairValue, NotReady};
@@ -40,6 +42,8 @@ pub struct MarketMaker {
     volatility: Option<Volatility>,
     /// Which way Binance is going (only with `momentum_lean`).
     momentum: Option<Momentum>,
+    /// Binance's channel over `channel_secs` (only with `channel_lean_bps`).
+    channel: Option<Channel>,
     /// Binance's move over `big_move_secs` (only with `big_move_bps`).
     big_move: Option<Momentum>,
     /// Our recent fills: when, which side, how much (only with `fill_imbalance_bps`).
@@ -83,6 +87,9 @@ impl MarketMaker {
         let big_move = config
             .big_move_bps
             .map(|_| Momentum::new(Duration::from_secs(config.big_move_secs)));
+        let channel = config
+            .channel_lean_bps
+            .map(|_| Channel::new(Duration::from_secs(config.channel_secs)));
         let fair = FairValue::new(config.bybit_weight);
         Self {
             config,
@@ -91,6 +98,7 @@ impl MarketMaker {
             volatility,
             momentum,
             big_move,
+            channel,
             recent_fills: VecDeque::new(),
             book: None,
             bid: None,
@@ -137,6 +145,9 @@ impl MarketMaker {
                 }
                 if let Some(big_move) = &mut self.big_move {
                     big_move.on_price(mid, stamp.received_at);
+                }
+                if let Some(channel) = &mut self.channel {
+                    channel.on_price(mid.to_f64().unwrap_or(0.0), stamp.received_at);
                 }
             }
             Event::SecondReference { bid, ask, stamp } => {
@@ -424,16 +435,39 @@ impl MarketMaker {
         Duration::from_secs(self.config.basis_halflife_secs)
     }
 
-    /// Fair value shifted the way Binance just went (with `momentum_lean`).
+    /// Fair value shifted the way Binance just went (with `momentum_lean`)
+    /// and towards the line of a clean channel (with `channel_lean_bps`).
     fn lean_with_binance(&self, fair: Decimal) -> Decimal {
-        let (Some(lean), Some(momentum)) = (self.config.momentum_lean, &self.momentum) else {
+        let shift = self.momentum_shift_bps() + self.channel_shift_bps();
+        if shift.is_zero() {
             return fair;
-        };
-        let Some(moved) = momentum.move_bps() else {
-            return fair;
-        };
-        let shift = (moved * lean).clamp(-MAX_MOMENTUM_LEAN_BPS, MAX_MOMENTUM_LEAN_BPS);
+        }
         fair * (Decimal::ONE + shift / Decimal::from(10_000))
+    }
+
+    fn momentum_shift_bps(&self) -> Decimal {
+        let (Some(lean), Some(momentum)) = (self.config.momentum_lean, &self.momentum) else {
+            return Decimal::ZERO;
+        };
+        momentum.move_bps().map_or(Decimal::ZERO, |moved| {
+            (moved * lean).clamp(-MAX_MOMENTUM_LEAN_BPS, MAX_MOMENTUM_LEAN_BPS)
+        })
+    }
+
+    /// Near the lower edge of a clean channel: up (prices tend to bounce
+    /// back up); near the upper edge: down. Full lean two typical distances
+    /// from the line; none once the channel has broken.
+    fn channel_shift_bps(&self) -> Decimal {
+        let (Some(max), Some(channel)) = (self.config.channel_lean_bps, &self.channel) else {
+            return Decimal::ZERO;
+        };
+        match channel.position() {
+            Some(p) if p.fit >= self.config.channel_fit && p.distance.abs() <= channel::BROKEN => {
+                let towards_line = (-p.distance / 2.0).clamp(-1.0, 1.0);
+                (max * Decimal::from_f64(towards_line).unwrap_or_default()).round_dp(4)
+            }
+            _ => Decimal::ZERO,
+        }
     }
 
     /// Position handling on top of the plain quote (see `fill_imbalance_bps`
@@ -983,6 +1017,44 @@ mod tests {
         let soon = now + Duration::from_secs(1);
         binance(&mut mm, "99.2", "100.2", soon);
         mm.wanted_quotes(soon).0
+    }
+
+    /// A clean two-hour climb in Binance fed to the channel, ending at `last`
+    /// (the climb's line ends near 100.0 x 1.012); returns fair value's lean.
+    fn channel_lean_at(last: f64) -> Decimal {
+        let (mut mm, now) = warmed_up();
+        mm.config.channel_lean_bps = Some(d("2"));
+        let mut channel = Channel::new(Duration::from_secs(7200));
+        let start = now - Duration::from_secs(7200);
+        for m in 0..120u64 {
+            let wiggle = if m % 2 == 0 { 0.02 } else { -0.02 };
+            channel.on_price(
+                100.0 + 0.01 * m as f64 + wiggle,
+                start + Duration::from_secs(60 * m),
+            );
+        }
+        channel.on_price(last, now);
+        mm.channel = Some(channel);
+        mm.channel_shift_bps()
+    }
+
+    #[test]
+    fn leans_towards_the_line_of_a_clean_channel() {
+        assert!(channel_lean_at(101.17) > Decimal::ZERO, "a dip: lean up");
+        assert!(
+            channel_lean_at(101.23) < Decimal::ZERO,
+            "a spike: lean down"
+        );
+        assert!(
+            channel_lean_at(101.2).abs() < d("1"),
+            "on the line: little lean"
+        );
+        assert!(channel_lean_at(101.2).abs() <= d("2"), "never past the max");
+        assert_eq!(
+            channel_lean_at(100.5),
+            Decimal::ZERO,
+            "a broken channel: no lean"
+        );
     }
 
     #[test]

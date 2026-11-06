@@ -9,6 +9,7 @@ mod book;
 mod bot;
 mod bullet;
 mod bybit;
+mod channel;
 mod config;
 mod events;
 mod executor;

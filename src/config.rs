@@ -78,6 +78,17 @@ pub struct Config {
     pub big_move_bps: Option<Decimal>,
     #[serde(default = "default_big_move_secs")]
     pub big_move_secs: u64,
+    /// If Binance has moved in a clean channel over the last `channel_secs`
+    /// (a straight-line fit explains at least `channel_fit` of the moves,
+    /// 0 to 1), lean both quotes up to this many bps towards the line: up
+    /// near the lower edge, down near the upper edge, as prices tend to
+    /// bounce between the edges. No lean once the channel breaks. Off when unset.
+    #[serde(default)]
+    pub channel_lean_bps: Option<Decimal>,
+    #[serde(default = "default_channel_secs")]
+    pub channel_secs: u64,
+    #[serde(default = "default_channel_fit")]
+    pub channel_fit: f64,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -125,6 +136,14 @@ fn default_fill_imbalance_secs() -> u64 {
 
 fn default_big_move_secs() -> u64 {
     300
+}
+
+fn default_channel_secs() -> u64 {
+    7200
+}
+
+fn default_channel_fit() -> f64 {
+    0.7
 }
 
 /// The exchanges the bot can trade on.
@@ -201,6 +220,15 @@ impl Config {
         }
         if self.big_move_bps.is_some() && self.big_move_secs == 0 {
             bail!("big_move_secs must be greater than 0");
+        }
+        if self.channel_lean_bps.is_some_and(|b| b <= Decimal::ZERO) {
+            bail!("channel_lean_bps must be greater than 0");
+        }
+        if self.channel_lean_bps.is_some() && self.channel_secs < 600 {
+            bail!("channel_secs must be at least 600 (ten minutes)");
+        }
+        if !(0.0..1.0).contains(&self.channel_fit) {
+            bail!("channel_fit must be at least 0 and below 1");
         }
         if self.vol_spread_mult.is_some_and(|m| m <= Decimal::ZERO) {
             bail!("vol_spread_mult must be greater than 0");
@@ -394,6 +422,22 @@ mod tests {
         assert!(config.validate().is_err());
         config.big_move_bps = Some(Decimal::TEN);
         config.big_move_secs = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn the_channel_lean_is_off_unless_asked_for() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(config.channel_lean_bps, None);
+        assert_eq!((config.channel_secs, config.channel_fit), (7200, 0.7));
+        config.channel_lean_bps = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.channel_lean_bps = Some(Decimal::TWO);
+        assert!(config.validate().is_ok());
+        config.channel_secs = 60;
+        assert!(config.validate().is_err());
+        config.channel_secs = 7200;
+        config.channel_fit = 1.5;
         assert!(config.validate().is_err());
     }
 
