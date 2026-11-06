@@ -148,6 +148,12 @@ pub struct Config {
     /// CVD lean by this fraction (0 to 1). Needs `cvd_spot_symbol`.
     #[serde(default)]
     pub cvd_divergence: Option<Decimal>,
+    /// When spot is clearly buying (or selling) over the long window while
+    /// perps are flat, lean this many extra bps with spot: real buyers taking
+    /// coins, not leverage, tend to make steadier moves. Needs
+    /// `cvd_spot_symbol`. Off when unset.
+    #[serde(default)]
+    pub cvd_spot_lead_bps: Option<Decimal>,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -255,7 +261,9 @@ impl Config {
 
     /// Whether any CVD lean is on (and so the trade feeds are needed).
     pub fn cvd_enabled(&self) -> bool {
-        self.cvd_short_lean_bps.is_some() || self.cvd_long_lean_bps.is_some()
+        self.cvd_short_lean_bps.is_some()
+            || self.cvd_long_lean_bps.is_some()
+            || self.cvd_spot_lead_bps.is_some()
     }
 
     fn validate(&self) -> Result<()> {
@@ -354,6 +362,12 @@ impl Config {
         }
         if self.cvd_divergence.is_some() && self.cvd_spot_symbol.is_none() {
             bail!("cvd_divergence needs cvd_spot_symbol (spot to compare with)");
+        }
+        if self.cvd_spot_lead_bps.is_some_and(|b| b <= Decimal::ZERO) {
+            bail!("cvd_spot_lead_bps must be greater than 0");
+        }
+        if self.cvd_spot_lead_bps.is_some() && self.cvd_spot_symbol.is_none() {
+            bail!("cvd_spot_lead_bps needs cvd_spot_symbol (the spot trades it follows)");
         }
         if self.vol_spread_mult.is_some_and(|m| m <= Decimal::ZERO) {
             bail!("vol_spread_mult must be greater than 0");
@@ -618,6 +632,12 @@ mod tests {
             config.validate().is_err(),
             "short must be shorter than long"
         );
+        config.cvd_short_secs = 60;
+        config.cvd_spot_lead_bps = Some(Decimal::ONE);
+        assert!(config.validate().is_ok());
+        config.cvd_spot_symbol = None;
+        config.cvd_divergence = None;
+        assert!(config.validate().is_err(), "spot lead needs spot");
     }
 
     #[test]

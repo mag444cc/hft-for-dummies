@@ -32,6 +32,11 @@ const MAX_MOMENTUM_LEAN_BPS: Decimal = Decimal::TEN;
 /// How much Binance history the volatility spread looks at.
 const VOL_WINDOW: Duration = Duration::from_secs(60);
 
+/// Spot "clearly" buying or selling (`cvd_spot_lead_bps`): at least this
+/// lopsided over the long window, while perps are within `PERPS_FLAT` of even.
+const SPOT_LEADS: f64 = 0.3;
+const PERPS_FLAT: f64 = 0.15;
+
 /// MACD only counts as "well above/below zero" past this fraction of the price.
 const MACD_THRESHOLD: f64 = 0.0003;
 
@@ -541,6 +546,16 @@ impl MarketMaker {
                 && p * s < 0.0
             {
                 shift *= 1.0 - shrink;
+            }
+        }
+        if let Some(lead) = self.config.cvd_spot_lead_bps.and_then(|b| b.to_f64()) {
+            let window = Duration::from_secs(self.config.cvd_long_secs);
+            let perp = cvd.imbalance(FlowMarket::Perp, window, now).unwrap_or(0.0);
+            if let Some(spot) = cvd.imbalance(FlowMarket::Spot, window, now)
+                && spot.abs() >= SPOT_LEADS
+                && perp.abs() < PERPS_FLAT
+            {
+                shift += lead * spot.signum();
             }
         }
         Decimal::from_f64(shift).unwrap_or_default().round_dp(4)
@@ -1388,6 +1403,47 @@ mod tests {
         assert_eq!(
             cvd_lean("-2", "-1", None, (3.0, 1.0), (1.0, 0.0)),
             d("-2.25")
+        );
+    }
+
+    /// Only the spot-lead lean (1 bps), with perps and spot as given.
+    fn spot_lead(perp: (f64, f64), spot: (f64, f64)) -> Decimal {
+        let (mut mm, now) = warmed_up();
+        mm.config.cvd_spot_lead_bps = Some(d("1"));
+        let mut cvd = Cvd::new(Duration::from_secs(900));
+        cvd.on_flow(
+            FlowMarket::Perp,
+            perp.0,
+            perp.1,
+            now - Duration::from_secs(30),
+        );
+        cvd.on_flow(
+            FlowMarket::Spot,
+            spot.0,
+            spot.1,
+            now - Duration::from_secs(30),
+        );
+        mm.cvd = Some(cvd);
+        mm.cvd_shift_bps(now)
+    }
+
+    #[test]
+    fn spot_buying_while_perps_are_flat_leans_up() {
+        assert_eq!(
+            spot_lead((10.0, 10.0), (3.0, 1.0)),
+            d("1"),
+            "spot +0.5, perps even"
+        );
+        assert_eq!(spot_lead((10.0, 10.0), (1.0, 3.0)), d("-1"), "spot selling");
+        assert_eq!(
+            spot_lead((15.0, 5.0), (3.0, 1.0)),
+            Decimal::ZERO,
+            "perps not flat"
+        );
+        assert_eq!(
+            spot_lead((10.0, 10.0), (11.0, 10.0)),
+            Decimal::ZERO,
+            "spot only slightly up"
         );
     }
 
