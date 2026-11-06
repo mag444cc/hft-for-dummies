@@ -38,8 +38,11 @@ struct BookTicker {
 /// reading the price never waits behind anything else the bot is doing (like
 /// an order request on the main runtime).
 pub fn connect(symbol: &str, bus: Bus) {
+    // Binance splits its futures streams by kind: the fast book streams
+    // (like bookTicker) under /public, trades and liquidations under /market
+    // (see flow.rs). The old unsplit /ws path still answers for now, but may not.
     let url = format!(
-        "wss://fstream.binance.com/ws/{}@bookTicker",
+        "wss://fstream.binance.com/public/ws/{}@bookTicker",
         symbol.to_lowercase()
     );
     std::thread::Builder::new()
