@@ -19,6 +19,7 @@ mod liveness;
 mod market_maker;
 mod strategy;
 mod telemetry;
+mod volatility;
 
 use std::path::{Path, PathBuf};
 

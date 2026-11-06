@@ -42,6 +42,11 @@ pub struct Config {
     pub max_position: Decimal,
     /// How far (bps) both quotes lean against our position when it is at the max.
     pub skew_bps: Decimal,
+    /// Widen the spread when the market is jumpy: quote at least this many
+    /// times Binance's typical move over one `min_requote_ms` (measured over
+    /// the last minute). `spread_bps` stays the minimum. Off when unset.
+    #[serde(default)]
+    pub vol_spread_mult: Option<Decimal>,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -125,6 +130,9 @@ impl Config {
             && urgent <= Decimal::ZERO
         {
             bail!("urgent_requote_bps must be greater than 0, got {urgent}");
+        }
+        if self.vol_spread_mult.is_some_and(|m| m <= Decimal::ZERO) {
+            bail!("vol_spread_mult must be greater than 0");
         }
         if self.paper_fee_bps.is_some_and(|fee| fee < Decimal::ZERO) {
             bail!("paper_fee_bps can't be negative");
@@ -271,6 +279,16 @@ mod tests {
         config.urgent_requote_bps = Some(Decimal::ZERO);
         assert!(config.validate().is_err());
         config.urgent_requote_bps = Some(Decimal::ONE);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_volatility_multiplier_must_be_positive() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(config.vol_spread_mult, None, "off unless asked for");
+        config.vol_spread_mult = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.vol_spread_mult = Some(Decimal::ONE);
         assert!(config.validate().is_ok());
     }
 

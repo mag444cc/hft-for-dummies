@@ -3,7 +3,8 @@
 //! A market maker earns the spread: buy a little below fair value, sell a
 //! little above it, repeat. Three rules on top of that:
 //!
-//! 1. **Spread.** Quote `spread_bps` either side of fair value.
+//! 1. **Spread.** Quote `spread_bps` either side of fair value (the market
+//!    maker may widen it when the market is jumpy, see `volatility.rs`).
 //! 2. **Skew.** If we're long, lean both quotes down so we're more likely to
 //!    sell (and less likely to buy more). Short: lean up. This keeps
 //!    inventory near zero without ever crossing the spread to dump it.
@@ -76,13 +77,14 @@ pub fn quote(
     config: &Config,
     book: &Book,
     ticks: Ticks,
+    spread_bps: Decimal,
 ) -> Quotes {
     // How full our inventory is, from -1 (max short) to +1 (max long).
     let fullness = (position / config.max_position).clamp(Decimal::NEGATIVE_ONE, Decimal::ONE);
     let lean_bps = config.skew_bps * fullness;
 
-    let bid = fair * (Decimal::ONE - (config.spread_bps + lean_bps) / BPS);
-    let ask = fair * (Decimal::ONE + (config.spread_bps - lean_bps) / BPS);
+    let bid = fair * (Decimal::ONE - (spread_bps + lean_bps) / BPS);
+    let ask = fair * (Decimal::ONE + (spread_bps - lean_bps) / BPS);
 
     let room_to_buy = position + config.order_size <= config.max_position;
     let room_to_sell = position - config.order_size >= -config.max_position;
@@ -176,6 +178,7 @@ mod tests {
             &config(),
             &wide_book(),
             FIVE_FIGURES,
+            config().spread_bps,
         );
         assert_eq!(
             q,
@@ -188,7 +191,14 @@ mod tests {
 
     #[test]
     fn flat_quotes_spread_either_side() {
-        let q = quote(d("100"), Decimal::ZERO, &config(), &wide_book(), TICKS);
+        let q = quote(
+            d("100"),
+            Decimal::ZERO,
+            &config(),
+            &wide_book(),
+            TICKS,
+            config().spread_bps,
+        );
         assert_eq!(
             q,
             Quotes {
@@ -201,7 +211,14 @@ mod tests {
     #[test]
     fn long_leans_both_quotes_down() {
         // Half full: lean 5 bps.
-        let q = quote(d("100"), d("0.5"), &config(), &wide_book(), TICKS);
+        let q = quote(
+            d("100"),
+            d("0.5"),
+            &config(),
+            &wide_book(),
+            TICKS,
+            config().spread_bps,
+        );
         assert_eq!(
             q,
             Quotes {
@@ -213,7 +230,14 @@ mod tests {
 
     #[test]
     fn short_leans_both_quotes_up() {
-        let q = quote(d("100"), d("-0.5"), &config(), &wide_book(), TICKS);
+        let q = quote(
+            d("100"),
+            d("-0.5"),
+            &config(),
+            &wide_book(),
+            TICKS,
+            config().spread_bps,
+        );
         assert_eq!(
             q,
             Quotes {
@@ -225,21 +249,42 @@ mod tests {
 
     #[test]
     fn stops_buying_at_max_long() {
-        let q = quote(d("100"), d("1"), &config(), &wide_book(), TICKS);
+        let q = quote(
+            d("100"),
+            d("1"),
+            &config(),
+            &wide_book(),
+            TICKS,
+            config().spread_bps,
+        );
         assert_eq!(q.bid, None);
         assert!(q.ask.is_some());
     }
 
     #[test]
     fn stops_selling_at_max_short() {
-        let q = quote(d("100"), d("-1"), &config(), &wide_book(), TICKS);
+        let q = quote(
+            d("100"),
+            d("-1"),
+            &config(),
+            &wide_book(),
+            TICKS,
+            config().spread_bps,
+        );
         assert_eq!(q.ask, None);
         assert!(q.bid.is_some());
     }
 
     #[test]
     fn stops_buying_when_one_more_order_would_pass_the_max() {
-        let q = quote(d("100"), d("0.95"), &config(), &wide_book(), TICKS);
+        let q = quote(
+            d("100"),
+            d("0.95"),
+            &config(),
+            &wide_book(),
+            TICKS,
+            config().spread_bps,
+        );
         assert_eq!(q.bid, None);
     }
 
@@ -247,14 +292,48 @@ mod tests {
     fn never_crosses_the_book() {
         // Fair value says bid 99.90, but the best ask is 99.50.
         let book = Book::from_levels(&[(d("99.40"), d("1"))], &[(d("99.50"), d("1"))]);
-        let q = quote(d("100"), Decimal::ZERO, &config(), &book, TICKS);
+        let q = quote(
+            d("100"),
+            Decimal::ZERO,
+            &config(),
+            &book,
+            TICKS,
+            config().spread_bps,
+        );
         assert_eq!(q.bid, Some(d("99.49")), "one tick under the best ask");
         assert_eq!(q.ask, Some(d("100.10")));
     }
 
     #[test]
+    fn quotes_the_spread_it_is_given() {
+        // The market maker can widen the spread (volatility); 20 bps here.
+        let q = quote(
+            d("100"),
+            Decimal::ZERO,
+            &config(),
+            &wide_book(),
+            TICKS,
+            d("20"),
+        );
+        assert_eq!(
+            q,
+            Quotes {
+                bid: Some(d("99.80")),
+                ask: Some(d("100.20"))
+            }
+        );
+    }
+
+    #[test]
     fn rounds_bids_down_and_asks_up_to_the_tick() {
-        let q = quote(d("100.003"), Decimal::ZERO, &config(), &wide_book(), TICKS);
+        let q = quote(
+            d("100.003"),
+            Decimal::ZERO,
+            &config(),
+            &wide_book(),
+            TICKS,
+            config().spread_bps,
+        );
         assert_eq!(
             q,
             Quotes {

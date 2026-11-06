@@ -18,6 +18,10 @@ use crate::events::{Event, Fill, Intent, Order, Side};
 use crate::fair_value::{FairValue, NotReady};
 use crate::inventory::Inventory;
 use crate::strategy::{self, Quotes, Ticks};
+use crate::volatility::Volatility;
+
+/// How much Binance history the volatility spread looks at.
+const VOL_WINDOW: Duration = Duration::from_secs(60);
 
 /// How often to check our fills against the exchange's record.
 const FILL_CHECK_EVERY: Duration = Duration::from_secs(10);
@@ -27,6 +31,8 @@ pub struct MarketMaker {
     /// Which prices the exchange accepts on this market.
     ticks: Ticks,
     fair: FairValue,
+    /// How jumpy Binance is (only with `vol_spread_mult`).
+    volatility: Option<Volatility>,
     book: Option<(Book, Instant)>,
     bid: Option<Order>,
     ask: Option<Order>,
@@ -50,10 +56,18 @@ impl MarketMaker {
         let next_client_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(1, |d| d.as_millis() as u64 * 1000);
+        // Moves over one requote gap: how far the price can go before we can follow.
+        let volatility = config.vol_spread_mult.map(|_| {
+            Volatility::new(
+                Duration::from_millis(config.min_requote_ms.max(100)),
+                VOL_WINDOW,
+            )
+        });
         Self {
             config,
             ticks,
             fair: FairValue::default(),
+            volatility,
             book: None,
             bid: None,
             ask: None,
@@ -87,7 +101,10 @@ impl MarketMaker {
     pub fn on_event(&mut self, event: &Event, now: Instant) -> Vec<Intent> {
         match event {
             Event::Reference { bid, ask, stamp } => {
-                self.fair.on_binance(*bid, *ask, stamp.received_at)
+                self.fair.on_binance(*bid, *ask, stamp.received_at);
+                if let Some(volatility) = &mut self.volatility {
+                    volatility.on_price((*bid + *ask) / Decimal::TWO, stamp.received_at);
+                }
             }
             Event::Book(book, _) => {
                 if let Some(mid) = book.mid() {
@@ -263,6 +280,7 @@ impl MarketMaker {
                     &self.config,
                     book,
                     self.ticks,
+                    self.spread_bps(),
                 ),
                 "quoting",
             ),
@@ -353,6 +371,15 @@ impl MarketMaker {
         Duration::from_secs(self.config.basis_halflife_secs)
     }
 
+    /// The spread to quote: `spread_bps`, or wider if the market is jumpy.
+    fn spread_bps(&self) -> Decimal {
+        let jumpy = match (self.config.vol_spread_mult, &self.volatility) {
+            (Some(mult), Some(volatility)) => volatility.move_bps().map(|m| m * mult),
+            _ => None,
+        };
+        jumpy.map_or(self.config.spread_bps, |j| j.max(self.config.spread_bps))
+    }
+
     pub fn log_summary(&self) {
         let fair = self.fair.get(Instant::now(), self.reference_stale()).ok();
         tracing::info!(
@@ -365,6 +392,9 @@ impl MarketMaker {
             show(self.pnl().map(|p| p.round_dp(4))),
             self.inventory.fees
         );
+        if self.volatility.is_some() {
+            tracing::info!("spread now {} bps", self.spread_bps().round_dp(2));
+        }
     }
 }
 
@@ -494,6 +524,70 @@ mod tests {
         let later = now + Duration::from_millis(2000);
         binance(&mut mm, "99.6", "100.6", later);
         assert_eq!(places(&mm.requote(later)).len(), 2);
+    }
+
+    /// Warmed up (1 s requote gap), then 60 s of Binance moving `swing` up
+    /// and back every second, with the books following. Returns how far each
+    /// quote then sits from their midpoint, in bps (half the bid-ask width).
+    fn spread_after(swing: &str, vol_mult: Option<&str>) -> Decimal {
+        let (mut mm, start) = warmed_up();
+        mm.config.min_requote_ms = 1000;
+        mm.config.vol_spread_mult = vol_mult.map(d);
+        mm.volatility = mm
+            .config
+            .vol_spread_mult
+            .map(|_| Volatility::new(Duration::from_secs(1), VOL_WINDOW));
+        let mut now = start;
+        for step in 0..600u64 {
+            now = start + Duration::from_millis(step * 100);
+            let mid = if (step / 10) % 2 == 0 {
+                d("100")
+            } else {
+                d("100") + d(swing)
+            };
+            let half = d("0.5");
+            mm.on_event(
+                &Event::Reference {
+                    bid: mid - half,
+                    ask: mid + half,
+                    stamp: Stamp::at(now),
+                },
+                now,
+            );
+            let book = Book::from_levels(&[(mid - half, d("10"))], &[(mid + half, d("10"))]);
+            mm.on_event(&Event::Book(book, Stamp::at(now)), now);
+        }
+        let intents = mm.requote(now + Duration::from_secs(2));
+        let p = places(&intents);
+        let (bid, ask) = (p[0].1, p[1].1);
+        ((ask - bid) / (ask + bid) * Decimal::from(10_000)).round_dp(1)
+    }
+
+    #[test]
+    fn a_jumpy_market_widens_the_spread() {
+        // Binance swings 20 bps a second; spread at least 1 x that typical move.
+        let spread = spread_after("0.2", Some("1"));
+        assert!(spread >= d("19"), "quoted {spread} bps, expected about 20");
+    }
+
+    #[test]
+    fn a_calm_market_keeps_the_minimum_spread() {
+        // Swings of 1 bp: 1 x 1 bp is below spread_bps (10), so 10 it is
+        // (give or take the rounding to the 0.01 price step).
+        let spread = spread_after("0.01", Some("1"));
+        assert!(
+            spread >= d("9.5") && spread <= d("11"),
+            "quoted {spread} bps"
+        );
+    }
+
+    #[test]
+    fn without_vol_spread_mult_the_spread_is_fixed() {
+        let spread = spread_after("0.2", None);
+        assert!(
+            spread >= d("9.5") && spread <= d("11"),
+            "quoted {spread} bps"
+        );
     }
 
     #[test]
