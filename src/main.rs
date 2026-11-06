@@ -10,6 +10,7 @@ mod bot;
 mod bullet;
 mod bybit;
 mod channel;
+mod clock;
 mod config;
 mod events;
 mod executor;

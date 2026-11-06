@@ -169,6 +169,23 @@ pub struct Config {
     /// on direction rather than making a market. No limit when unset.
     #[serde(default)]
     pub max_total_lean_bps: Option<Decimal>,
+    /// Extra spread (bps) on weekdays from `busy_start` to `busy_end`, New
+    /// York time: around the US stock market open, the jumpiest hours of the
+    /// crypto day (about 1.5 times the average over 2023-26). Following New
+    /// York time keeps the window on the open through daylight saving
+    /// (09:00-11:30 is 14:00-16:30 UTC in winter, 13:00-15:30 in summer).
+    /// Off when unset.
+    #[serde(default)]
+    pub busy_spread_bps: Option<Decimal>,
+    #[serde(default = "default_busy_start")]
+    pub busy_start: String,
+    #[serde(default = "default_busy_end")]
+    pub busy_end: String,
+    /// Spread change (bps) on Saturdays and Sundays (UTC), when markets are
+    /// calmest: negative tightens. The spread never goes below 0.1 bps.
+    /// Off when unset.
+    #[serde(default)]
+    pub weekend_spread_bps: Option<Decimal>,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -216,6 +233,14 @@ fn default_fill_imbalance_secs() -> u64 {
 
 fn default_big_move_secs() -> u64 {
     300
+}
+
+fn default_busy_start() -> String {
+    "09:00".into()
+}
+
+fn default_busy_end() -> String {
+    "11:30".into()
 }
 
 fn default_channel_secs() -> u64 {
@@ -384,6 +409,23 @@ impl Config {
         }
         if self.cvd_spot_lead_bps.is_some() && self.cvd_spot_symbol.is_none() {
             bail!("cvd_spot_lead_bps needs cvd_spot_symbol (the spot trades it follows)");
+        }
+        if self.busy_spread_bps.is_some_and(|b| b <= Decimal::ZERO) {
+            bail!("busy_spread_bps must be greater than 0");
+        }
+        match (
+            crate::clock::parse_hhmm(&self.busy_start),
+            crate::clock::parse_hhmm(&self.busy_end),
+        ) {
+            (Some(start), Some(end)) if start < end => {}
+            _ => bail!(
+                "busy_start and busy_end must be HH:MM (New York time), start before end; got {} and {}",
+                self.busy_start,
+                self.busy_end
+            ),
+        }
+        if self.weekend_spread_bps.is_some_and(|b| b.is_zero()) {
+            bail!("a weekend_spread_bps of 0 does nothing; leave it out instead");
         }
         if self.max_total_lean_bps.is_some_and(|b| b <= Decimal::ZERO) {
             bail!("max_total_lean_bps must be greater than 0");
@@ -663,6 +705,27 @@ mod tests {
         config.cvd_spot_symbol = None;
         config.cvd_divergence = None;
         assert!(config.validate().is_err(), "spot lead needs spot");
+    }
+
+    #[test]
+    fn busy_hours_are_off_unless_asked_for() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(
+            (config.busy_spread_bps, config.weekend_spread_bps),
+            (None, None)
+        );
+        assert_eq!(
+            (config.busy_start.as_str(), config.busy_end.as_str()),
+            ("09:00", "11:30")
+        );
+        config.busy_spread_bps = Some(Decimal::ONE);
+        config.weekend_spread_bps = Some(Decimal::NEGATIVE_ONE);
+        assert!(config.validate().is_ok());
+        config.busy_end = "08:00".into();
+        assert!(config.validate().is_err(), "end before start");
+        config.busy_end = "11:30".into();
+        config.busy_spread_bps = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -16,6 +16,7 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 use crate::book::Book;
 use crate::channel::{self, Channel};
+use crate::clock;
 use crate::config::Config;
 use crate::events::{Event, Fill, FlowMarket, Intent, Order, Side};
 use crate::fair_value::{FairValue, NotReady};
@@ -68,6 +69,9 @@ pub struct MarketMaker {
     /// Aggressive buying and selling on Binance perps and Bybit spot (only
     /// with a CVD lean).
     cvd: Option<Cvd>,
+    /// Wall-clock time of the latest Binance price (unix seconds), for the
+    /// time-of-day settings. In a replay it is the recording's own time.
+    wall_secs: Option<i64>,
     /// Since when we've held a position the channel bounce favours, near an
     /// edge (only with `channel_hold`).
     holding_since: Option<Instant>,
@@ -139,6 +143,7 @@ impl MarketMaker {
             macd_candles,
             macd_signal: None,
             cvd,
+            wall_secs: None,
             book: None,
             bid: None,
             ask: None,
@@ -175,6 +180,9 @@ impl MarketMaker {
         match event {
             Event::Reference { bid, ask, stamp } => {
                 self.fair.on_binance(*bid, *ask, stamp.received_at);
+                if stamp.received_unix_us > 0 {
+                    self.wall_secs = Some((stamp.received_unix_us / 1_000_000) as i64);
+                }
                 let mid = (*bid + *ask) / Decimal::TWO;
                 if let Some(volatility) = &mut self.volatility {
                     volatility.on_price(mid, stamp.received_at);
@@ -741,7 +749,32 @@ impl MarketMaker {
             (Some(mult), Some(volatility)) => volatility.move_bps().map(|m| m * mult),
             _ => None,
         };
-        jumpy.map_or(self.config.spread_bps, |j| j.max(self.config.spread_bps))
+        let spread = jumpy.map_or(self.config.spread_bps, |j| j.max(self.config.spread_bps));
+        spread + self.time_of_day_bps()
+    }
+
+    /// `busy_spread_bps` around the US open (weekdays, New York time) and
+    /// `weekend_spread_bps` on UTC weekends; never pushes the spread below 0.1 bps.
+    fn time_of_day_bps(&self) -> Decimal {
+        let Some(now) = self.wall_secs else {
+            return Decimal::ZERO;
+        };
+        let mut extra = Decimal::ZERO;
+        if let Some(busy) = self.config.busy_spread_bps {
+            let (day, minute) = clock::new_york(now);
+            let start = clock::parse_hhmm(&self.config.busy_start).unwrap_or(540);
+            let end = clock::parse_hhmm(&self.config.busy_end).unwrap_or(690);
+            if day < 5 && (start..end).contains(&minute) {
+                extra += busy;
+            }
+        }
+        if let Some(weekend) = self.config.weekend_spread_bps
+            && clock::utc_weekend(now)
+        {
+            extra += weekend;
+        }
+        // Keep at least 0.1 bps of spread whatever the weekend setting says.
+        extra.max(Decimal::new(1, 1) - self.config.spread_bps)
     }
 
     /// How this run went so far (for the backtester).
@@ -1546,6 +1579,46 @@ mod tests {
         assert_eq!(
             cvd_lean("0.0001", "2", Some("0.5"), (3.0, 1.0), (0.0, 1.0)).round_dp(2),
             d("-0.25")
+        );
+    }
+
+    /// The spread with busy 2 bps and weekend -1 bps, at a UTC time (unix seconds).
+    fn spread_at(unix_secs: i64) -> Decimal {
+        let (mut mm, _) = warmed_up();
+        mm.config.busy_spread_bps = Some(d("2"));
+        mm.config.weekend_spread_bps = Some(d("-1"));
+        mm.wall_secs = Some(unix_secs);
+        mm.spread_bps()
+    }
+
+    #[test]
+    fn wider_around_the_us_open_tighter_at_weekends() {
+        // warmed_up quotes 10 bps. Friday 2026-11-06 (winter): the open is 14:30 UTC.
+        let friday = 1_794_009_600 - 86_400; // 2026-11-06 00:00 UTC
+        assert_eq!(
+            spread_at(friday + 13 * 3600 + 59 * 60),
+            d("10"),
+            "13:59 UTC: not yet"
+        );
+        assert_eq!(
+            spread_at(friday + 14 * 3600),
+            d("12"),
+            "14:00 UTC = 09:00 New York"
+        );
+        assert_eq!(
+            spread_at(friday + 16 * 3600 + 29 * 60),
+            d("12"),
+            "16:29 UTC"
+        );
+        assert_eq!(
+            spread_at(friday + 16 * 3600 + 30 * 60),
+            d("10"),
+            "16:30 UTC: over"
+        );
+        assert_eq!(
+            spread_at(friday + 86_400 + 15 * 3600),
+            d("9"),
+            "Saturday: tighter"
         );
     }
 
