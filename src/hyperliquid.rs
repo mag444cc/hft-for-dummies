@@ -163,9 +163,13 @@ pub async fn connect(config: &Config, bus: Bus) -> Result<Hyperliquid> {
     let coin = config.symbol.clone();
     spawn_socket(
         ws.clone(),
-        vec![json!({"type": "l2Book", "coin": coin})],
+        vec![
+            json!({"type": "l2Book", "coin": coin}),
+            // Everyone's trades: dry run fills paper orders from these.
+            json!({"type": "trades", "coin": coin}),
+        ],
         bus.clone(),
-        move |msg| book_event(msg, &coin).into_iter().collect(),
+        move |msg| market_events(msg, &coin),
     );
     if let Some(account) = &account {
         let coin = config.symbol.clone();
@@ -630,6 +634,42 @@ struct UserFills {
     fills: Vec<HlFill>,
 }
 
+/// The market socket: the book, or other people's trades.
+fn market_events(msg: &Value, coin: &str) -> Vec<Event> {
+    match msg["channel"].as_str() {
+        Some("l2Book") => book_event(msg, coin).into_iter().collect(),
+        Some("trades") => trade_events(msg, coin),
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Deserialize)]
+struct MarketTrade {
+    coin: String,
+    px: Decimal,
+    sz: Decimal,
+    /// ms since 1970.
+    time: u64,
+}
+
+/// Trades on the market. The first message after connecting replays recent
+/// ones; their `time` lets the paper executor tell.
+fn trade_events(msg: &Value, coin: &str) -> Vec<Event> {
+    let Ok(trades) = serde_json::from_value::<Vec<MarketTrade>>(msg["data"].clone()) else {
+        tracing::warn!("hyperliquid: bad trades message");
+        return Vec::new();
+    };
+    trades
+        .iter()
+        .filter(|t| t.coin == coin)
+        .map(|t| Event::Trade {
+            price: t.px,
+            size: t.sz,
+            stamp: Stamp::now(Some(t.time * 1000), Some(t.time * 1000)),
+        })
+        .collect()
+}
+
 /// A book message: the whole top of the book, every time.
 fn book_event(msg: &Value, coin: &str) -> Option<Event> {
     if msg["channel"] != "l2Book" {
@@ -833,6 +873,21 @@ mod tests {
         assert_eq!(stamp.exchange_unix_us, Some(1_700_000_000_000_000));
         assert!(book_event(&msg, "ETH").is_none(), "another coin's book");
         assert!(book_event(&parse(r#"{"channel":"pong"}"#), "SOL").is_none());
+    }
+
+    #[test]
+    fn reads_other_peoples_trades() {
+        let msg = parse(
+            r#"{"channel":"trades","data":[
+                {"coin":"SOL","side":"A","px":"90.218","sz":"0.18","time":1793925611003,"hash":"0x0","tid":1,"users":["0x1","0x2"]},
+                {"coin":"ETH","side":"B","px":"2240","sz":"1","time":1793925611004,"hash":"0x0","tid":2,"users":["0x1","0x2"]}]}"#,
+        );
+        let events = market_events(&msg, "SOL");
+        let [Event::Trade { price, size, stamp }] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        assert_eq!((*price, *size), (d("90.218"), d("0.18")));
+        assert_eq!(stamp.exchange_unix_us, Some(1_793_925_611_003_000));
     }
 
     #[test]

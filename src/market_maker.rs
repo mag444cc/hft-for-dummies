@@ -153,7 +153,9 @@ impl MarketMaker {
                     return vec![Intent::SyncFills];
                 }
             }
-            Event::Disconnected(_)
+            // Other people's trades only matter to the paper executor.
+            Event::Trade { .. }
+            | Event::Disconnected(_)
             | Event::Shutdown
             | Event::OrderLive { .. }
             | Event::Sent { .. } => {}

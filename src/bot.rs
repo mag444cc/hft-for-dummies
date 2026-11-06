@@ -74,9 +74,10 @@ async fn trade(
     spawn_ctrl_c(bus.clone());
 
     let dry_run = config.dry_run;
+    let paper_fee = config.paper_fee_bps.unwrap_or_default();
     let market_maker = MarketMaker::new(config, ticks);
     if dry_run {
-        event_loop(market_maker, PaperExecutor::new(bus), events).await
+        event_loop(market_maker, PaperExecutor::new(bus, paper_fee), events).await
     } else {
         event_loop(market_maker, LiveExecutor::new(venue, bus), events).await
     }

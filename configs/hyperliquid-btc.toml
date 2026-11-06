@@ -28,6 +28,7 @@ quote_ttl_secs = 30           # if the bot dies, Hyperliquid cancels our orders 
 
 # --- Safety ---
 max_loss_usd = "3"            # stop quoting for this run after losing this much (fees included)
+paper_fee_bps = "1.5"         # dry run: charge Hyperliquid's base maker fee on paper fills
 reference_stale_secs = 5      # no Binance price for 5s: pull quotes
 book_stale_secs = 10          # no Hyperliquid book update for 10s: pull quotes
 basis_halflife_secs = 300     # average the Binance-Hyperliquid gap over ~5 minutes

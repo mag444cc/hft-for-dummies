@@ -41,6 +41,13 @@ pub enum Event {
     Book(Book, Stamp),
     /// Our copy of the order book is out of sync; don't trust it.
     BookLost,
+    /// Someone traded on the exchange (anyone, not just us), at this price
+    /// and size. Dry run uses these to fill paper orders realistically.
+    Trade {
+        price: Decimal,
+        size: Decimal,
+        stamp: Stamp,
+    },
     /// One of our orders (partly) filled.
     Fill(Fill),
     /// One of our orders left the book without filling (cancelled or rejected).

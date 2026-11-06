@@ -64,6 +64,12 @@ paper: place side=Sell price=100.758 size=0.05
 mid 100.656 | fair 100.6573 | our bid 100.556 ask 100.758 | position 0 | pnl $0 (fees $0)
 ```
 
+Paper orders fill the way real ones would: they join the back of the queue
+at their price and fill only when the market trades there (on Hyperliquid,
+from its public trade feed). Even so, treat dry-run profit as an upper bound:
+paper orders are never late, and a real order's place in the queue is never
+known exactly.
+
 Settings are in `bot.toml`. Using a coding agent? Ask it to *"set me up and
 run the bot"*; `AGENTS.md` has its instructions.
 
@@ -154,7 +160,7 @@ Feeds turn the world into **events**, the market maker answers with
 | `src/strategy.rs` | Bid and ask prices: spread, skew, limits |
 | `src/market_maker.rs` | Events in, intents out. No I/O, fully tested |
 | `src/inventory.rs` | Position and PnL, changed only by fills |
-| `src/executor.rs` | Live orders on either exchange (the `Venue` trait), or paper ones in dry run |
+| `src/executor.rs` | Live orders on either exchange (the `Venue` trait), or paper ones in dry run that queue and fill like real ones |
 
 ## Following along
 

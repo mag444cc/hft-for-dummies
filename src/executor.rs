@@ -19,6 +19,7 @@ use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::book::Book;
 use crate::events::{Bus, Event, Fill, Intent, Order, SentKind, Side};
 
 pub trait Executor {
@@ -223,21 +224,94 @@ fn unix_us() -> u64 {
         .map_or(0, |d| d.as_micros() as u64)
 }
 
-/// Dry run: orders live only in memory.
+/// Dry run: orders live only in memory, and fill the way a real one would.
+///
+/// A real order joins the back of the queue at its price, and fills only when
+/// someone trades at that price, after everyone ahead of it. So:
+///
+/// - Placing an order, we note how much already rests at our price: the
+///   queue *ahead* of us.
+/// - When the book shows less resting there (some left), we move up.
+/// - A trade at our price uses up the queue ahead first; whatever is left of
+///   it fills us, maybe only in part.
+/// - A trade, or the book, going *through* our price means everyone at our
+///   price was filled, us too.
+///
+/// Without a feed of the market's trades (Bullet), only that last rule
+/// fills. Still a little kind to us: our orders arrive and leave instantly.
 pub struct PaperExecutor {
-    resting: Vec<Order>,
+    resting: Vec<PaperOrder>,
+    /// The latest book, to see the queue at a price when we join it.
+    book: Option<Book>,
     bus: Bus,
     next_trade_id: u64,
+    /// Fee per fill, as a fraction of its value (bps / 10,000).
+    fee_rate: Decimal,
+}
+
+struct PaperOrder {
+    order: Order,
+    /// Not filled yet.
+    left: Decimal,
+    /// Others resting at our price before us.
+    ahead: Decimal,
+    /// When we placed it (µs since 1970): earlier trades can't fill it.
+    placed_unix_us: u64,
 }
 
 impl PaperExecutor {
-    pub fn new(bus: Bus) -> Self {
+    pub fn new(bus: Bus, fee_bps: Decimal) -> Self {
         Self {
             resting: Vec::new(),
+            book: None,
             bus,
             next_trade_id: 0,
+            fee_rate: fee_bps / Decimal::from(10_000),
         }
     }
+
+    /// Join the back of the queue at the order's price.
+    fn rest(&mut self, order: Order) {
+        let ahead = self.book.as_ref().map_or(Decimal::ZERO, |book| {
+            queue_at(book, order.side, order.price)
+        });
+        self.resting.push(PaperOrder {
+            order,
+            left: order.size,
+            ahead,
+            placed_unix_us: unix_us(),
+        });
+    }
+
+    /// Fill `size` of resting order `i`, and report it like the exchange would.
+    fn fill(&mut self, i: usize, size: Decimal) {
+        let paper = &mut self.resting[i];
+        let size = size.min(paper.left);
+        if size <= Decimal::ZERO {
+            return;
+        }
+        paper.left -= size;
+        self.next_trade_id += 1;
+        let order = paper.order;
+        let _ = self.bus.send(Event::Fill(Fill {
+            trade_id: self.next_trade_id,
+            client_id: Some(order.client_id),
+            side: order.side,
+            price: order.price,
+            size,
+            fee: (order.price * size * self.fee_rate).round_dp(8),
+            order_finished: paper.left.is_zero(),
+        }));
+    }
+}
+
+/// How much others have resting at `price` on our side of the book.
+fn queue_at(book: &Book, side: Side, price: Decimal) -> Decimal {
+    let level = match side {
+        Side::Buy => book.bids.get(&price),
+        Side::Sell => book.asks.get(&price),
+    };
+    level.copied().unwrap_or(Decimal::ZERO)
 }
 
 impl Executor for PaperExecutor {
@@ -248,14 +322,16 @@ impl Executor for PaperExecutor {
             match intent {
                 Intent::Place(order) => {
                     tracing::info!(side = ?order.side, price = %order.price, size = %order.size, "paper: place");
-                    self.resting.push(order);
+                    self.rest(order);
                 }
                 Intent::Replace { old, new } => {
                     tracing::info!(side = ?new.side, price = %new.price, size = %new.size, "paper: replace");
-                    self.resting.retain(|o| o.client_id != old);
-                    self.resting.push(new);
+                    self.resting.retain(|o| o.order.client_id != old);
+                    self.rest(new);
                 }
-                Intent::Cancel { client_id } => self.resting.retain(|o| o.client_id != client_id),
+                Intent::Cancel { client_id } => {
+                    self.resting.retain(|o| o.order.client_id != client_id)
+                }
                 Intent::CancelAll => self.resting.clear(),
                 // Paper trading starts flat and only changes by paper fills.
                 Intent::SyncPosition | Intent::SyncFills => {}
@@ -263,30 +339,54 @@ impl Executor for PaperExecutor {
         }
     }
 
-    /// Fill any order the book has traded through, at the order's price.
-    /// Optimistic: a real order waits in a queue behind others at its price
-    /// and might never fill. Treat dry-run profit as a best case.
     fn on_event(&mut self, event: &Event) {
-        let Event::Book(book, _) = event else { return };
-        let (best_bid, best_ask) = (book.best_bid(), book.best_ask());
-        let crossed = |o: &Order| match o.side {
-            Side::Buy => best_ask.is_some_and(|ask| ask <= o.price),
-            Side::Sell => best_bid.is_some_and(|bid| bid >= o.price),
-        };
-        let (filled, resting): (Vec<Order>, Vec<Order>) = self.resting.drain(..).partition(crossed);
-        self.resting = resting;
-        for order in filled {
-            self.next_trade_id += 1;
-            let _ = self.bus.send(Event::Fill(Fill {
-                trade_id: self.next_trade_id,
-                client_id: Some(order.client_id),
-                side: order.side,
-                price: order.price,
-                size: order.size,
-                fee: Decimal::ZERO,
-                order_finished: true,
-            }));
+        match event {
+            Event::Book(book, _) => {
+                let (best_bid, best_ask) = (book.best_bid(), book.best_ask());
+                for i in 0..self.resting.len() {
+                    let o = &mut self.resting[i];
+                    // Fewer resting ahead of us than we thought: some left.
+                    o.ahead = o.ahead.min(queue_at(book, o.order.side, o.order.price));
+                    let through = match o.order.side {
+                        Side::Buy => best_ask.is_some_and(|ask| ask < o.order.price),
+                        Side::Sell => best_bid.is_some_and(|bid| bid > o.order.price),
+                    };
+                    if through {
+                        let left = o.left;
+                        self.fill(i, left);
+                    }
+                }
+                self.book = Some(book.clone());
+            }
+            Event::Trade { price, size, stamp } => {
+                for i in 0..self.resting.len() {
+                    let o = &mut self.resting[i];
+                    // A trade from before our order existed (the feed replays
+                    // recent trades when it connects) can't have filled it.
+                    if stamp
+                        .exchange_unix_us
+                        .is_some_and(|at| at < o.placed_unix_us)
+                    {
+                        continue;
+                    }
+                    let (ours, left) = (o.order.price, o.left);
+                    let through = match o.order.side {
+                        Side::Buy => *price < ours,
+                        Side::Sell => *price > ours,
+                    };
+                    if through {
+                        self.fill(i, left);
+                    } else if *price == ours {
+                        // The trade uses up the queue ahead of us first.
+                        let past_queue = *size - o.ahead;
+                        o.ahead = (o.ahead - *size).max(Decimal::ZERO);
+                        self.fill(i, past_queue);
+                    }
+                }
+            }
+            _ => return,
         }
+        self.resting.retain(|o| !o.left.is_zero());
     }
 }
 
@@ -296,7 +396,6 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::book::Book;
     use crate::events::Stamp;
 
     fn d(s: &str) -> Decimal {
@@ -307,63 +406,159 @@ mod tests {
         Event::Book(book, Stamp::at(Instant::now()))
     }
 
-    #[tokio::test]
-    async fn paper_fills_when_the_book_trades_through_our_price() {
-        let (bus, mut events) = mpsc::unbounded_channel();
-        let mut paper = PaperExecutor::new(bus);
-        let bid = Order {
+    fn trade(price: &str, size: &str) -> Event {
+        Event::Trade {
+            price: d(price),
+            size: d(size),
+            stamp: Stamp::at(Instant::now()),
+        }
+    }
+
+    fn bid(client_id: u64, price: &str, size: &str) -> Order {
+        Order {
             side: Side::Buy,
-            price: d("100"),
-            size: d("1"),
-            client_id: 7,
-        };
-        paper.execute(vec![Intent::Place(bid)]);
+            price: d(price),
+            size: d(size),
+            client_id,
+        }
+    }
+
+    /// Every fill reported so far, as (client id, size, finished).
+    fn fills(events: &mut mpsc::UnboundedReceiver<Event>) -> Vec<(Option<u64>, Decimal, bool)> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::Fill(f) = event {
+                out.push((f.client_id, f.size, f.order_finished));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn paper_fills_when_the_book_goes_through_our_price() {
+        let (bus, mut events) = mpsc::unbounded_channel();
+        let mut paper = PaperExecutor::new(bus, Decimal::ZERO);
+        paper.execute(vec![Intent::Place(bid(7, "100", "1"))]);
 
         // Best ask 100.5: above our bid, nothing happens.
         paper.on_event(&book_event(Book::from_levels(
             &[(d("99"), d("1"))],
             &[(d("100.5"), d("1"))],
         )));
-        assert!(events.try_recv().is_err());
-
-        // Best ask drops to 100: someone would have sold to us.
+        // Best ask 100, our price: sellers are there, but nobody traded with us.
         paper.on_event(&book_event(Book::from_levels(
             &[(d("99"), d("1"))],
             &[(d("100"), d("1"))],
         )));
-        let Ok(Event::Fill(fill)) = events.try_recv() else {
-            panic!("expected a fill")
-        };
-        assert_eq!(
-            (fill.client_id, fill.price, fill.side),
-            (Some(7), d("100"), Side::Buy)
-        );
+        assert!(fills(&mut events).is_empty(), "touching isn't filling");
+
+        // Best ask 99.9, below our bid: we must have been sold to.
+        paper.on_event(&book_event(Book::from_levels(
+            &[(d("99"), d("1"))],
+            &[(d("99.9"), d("1"))],
+        )));
+        assert_eq!(fills(&mut events), vec![(Some(7), d("1"), true)]);
 
         // Filled orders are gone.
         paper.on_event(&book_event(Book::from_levels(
             &[(d("99"), d("1"))],
             &[(d("99.5"), d("1"))],
         )));
-        assert!(events.try_recv().is_err());
+        assert!(fills(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn paper_waits_its_turn_behind_the_queue() {
+        let (bus, mut events) = mpsc::unbounded_channel();
+        let mut paper = PaperExecutor::new(bus, Decimal::ZERO);
+        // 5 already bid at 100 when we join: we're behind them.
+        paper.on_event(&book_event(Book::from_levels(
+            &[(d("100"), d("5"))],
+            &[(d("100.5"), d("1"))],
+        )));
+        paper.execute(vec![Intent::Place(bid(7, "100", "2"))]);
+
+        paper.on_event(&trade("100", "4"));
+        assert!(fills(&mut events).is_empty(), "4 of the 5 ahead filled");
+        paper.on_event(&trade("100", "2"));
+        assert_eq!(
+            fills(&mut events),
+            vec![(Some(7), d("1"), false)],
+            "the last 1 ahead, then 1 of our 2"
+        );
+        paper.on_event(&trade("100", "3"));
+        assert_eq!(fills(&mut events), vec![(Some(7), d("1"), true)]);
+    }
+
+    #[tokio::test]
+    async fn paper_moves_up_when_those_ahead_leave() {
+        let (bus, mut events) = mpsc::unbounded_channel();
+        let mut paper = PaperExecutor::new(bus, Decimal::ZERO);
+        paper.on_event(&book_event(Book::from_levels(
+            &[(d("100"), d("5"))],
+            &[(d("100.5"), d("1"))],
+        )));
+        paper.execute(vec![Intent::Place(bid(7, "100", "1"))]);
+        // Only 1 still bids at 100 (besides us): 4 ahead of us cancelled.
+        paper.on_event(&book_event(Book::from_levels(
+            &[(d("100"), d("1"))],
+            &[(d("100.5"), d("1"))],
+        )));
+        paper.on_event(&trade("100", "1.5"));
+        assert_eq!(fills(&mut events), vec![(Some(7), d("0.5"), false)]);
+    }
+
+    #[tokio::test]
+    async fn paper_fills_whole_on_a_trade_through_and_charges_the_fee() {
+        let (bus, mut events) = mpsc::unbounded_channel();
+        // 1.5 bps, Hyperliquid's base maker fee.
+        let mut paper = PaperExecutor::new(bus, d("1.5"));
+        paper.on_event(&book_event(Book::from_levels(
+            &[(d("100"), d("50"))],
+            &[(d("100.5"), d("1"))],
+        )));
+        paper.execute(vec![Intent::Place(bid(7, "100", "2"))]);
+        // A sale at 99.9 went past everyone bidding 100, us included.
+        paper.on_event(&trade("99.9", "0.1"));
+        let Ok(Event::Fill(fill)) = events.try_recv() else {
+            panic!("expected a fill")
+        };
+        assert_eq!((fill.size, fill.order_finished), (d("2"), true));
+        assert_eq!(fill.fee, d("0.03"), "100 * 2 * 0.00015");
+    }
+
+    #[tokio::test]
+    async fn paper_ignores_trades_from_before_the_order() {
+        let (bus, mut events) = mpsc::unbounded_channel();
+        let mut paper = PaperExecutor::new(bus, Decimal::ZERO);
+        paper.execute(vec![Intent::Place(bid(7, "100", "1"))]);
+        // A replayed trade from a minute ago, straight through our price.
+        let mut old = Stamp::at(Instant::now());
+        old.exchange_unix_us = Some(unix_us() - 60_000_000);
+        paper.on_event(&Event::Trade {
+            price: d("99"),
+            size: d("10"),
+            stamp: old,
+        });
+        assert!(fills(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn paper_ignores_trades_away_from_our_price() {
+        let (bus, mut events) = mpsc::unbounded_channel();
+        let mut paper = PaperExecutor::new(bus, Decimal::ZERO);
+        paper.execute(vec![Intent::Place(bid(7, "100", "1"))]);
+        paper.on_event(&trade("100.2", "10"));
+        assert!(fills(&mut events).is_empty());
     }
 
     #[tokio::test]
     async fn paper_replace_moves_the_order() {
         let (bus, mut events) = mpsc::unbounded_channel();
-        let mut paper = PaperExecutor::new(bus);
-        let bid = Order {
-            side: Side::Buy,
-            price: d("100"),
-            size: d("1"),
-            client_id: 1,
-        };
-        let moved = Order {
-            price: d("98"),
-            client_id: 2,
-            ..bid
-        };
+        let mut paper = PaperExecutor::new(bus, Decimal::ZERO);
+        let moved = bid(2, "98", "1");
         paper.execute(vec![
-            Intent::Place(bid),
+            Intent::Place(bid(1, "100", "1")),
             Intent::Replace { old: 1, new: moved },
         ]);
         // Asks down to 99: would have filled the old bid at 100, not the moved one at 98.
@@ -371,21 +566,18 @@ mod tests {
             &[(d("97"), d("1"))],
             &[(d("99"), d("1"))],
         )));
-        assert!(events.try_recv().is_err());
+        assert!(fills(&mut events).is_empty());
         paper.on_event(&book_event(Book::from_levels(
             &[(d("97"), d("1"))],
-            &[(d("98"), d("1"))],
+            &[(d("97.9"), d("1"))],
         )));
-        let Ok(Event::Fill(fill)) = events.try_recv() else {
-            panic!("expected a fill")
-        };
-        assert_eq!(fill.client_id, Some(2));
+        assert_eq!(fills(&mut events), vec![(Some(2), d("1"), true)]);
     }
 
     #[tokio::test]
     async fn paper_cancels_remove_orders() {
         let (bus, mut events) = mpsc::unbounded_channel();
-        let mut paper = PaperExecutor::new(bus);
+        let mut paper = PaperExecutor::new(bus, Decimal::ZERO);
         let ask = Order {
             side: Side::Sell,
             price: d("101"),

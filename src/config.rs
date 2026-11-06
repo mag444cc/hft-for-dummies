@@ -55,6 +55,11 @@ pub struct Config {
     /// quotes stop being fillable. The bot refreshes them at half this age.
     pub quote_ttl_secs: u64,
 
+    /// Dry run only: the fee each paper fill pays, in bps of its value, so
+    /// the dry-run profit is after fees (Hyperliquid's base maker fee is 1.5).
+    #[serde(default)]
+    pub paper_fee_bps: Option<Decimal>,
+
     /// Stop quoting for the rest of the run once we are down this much (USD, fees included).
     pub max_loss_usd: Decimal,
     /// Pull quotes if Binance goes quiet for this long.
@@ -120,6 +125,9 @@ impl Config {
             && urgent <= Decimal::ZERO
         {
             bail!("urgent_requote_bps must be greater than 0, got {urgent}");
+        }
+        if self.paper_fee_bps.is_some_and(|fee| fee < Decimal::ZERO) {
+            bail!("paper_fee_bps can't be negative");
         }
         if self.skew_bps < Decimal::ZERO {
             bail!("skew_bps can't be negative, got {}", self.skew_bps);
@@ -264,6 +272,14 @@ mod tests {
         assert!(config.validate().is_err());
         config.urgent_requote_bps = Some(Decimal::ONE);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_paper_fee_cant_be_negative() {
+        let mut config = Config::load(Path::new("configs/hyperliquid-sol.toml")).unwrap();
+        assert_eq!(config.paper_fee_bps, Some(Decimal::new(15, 1)));
+        config.paper_fee_bps = Some(Decimal::NEGATIVE_ONE);
+        assert!(config.validate().is_err());
     }
 
     #[test]
