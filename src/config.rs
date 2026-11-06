@@ -186,6 +186,24 @@ pub struct Config {
     /// Off when unset.
     #[serde(default)]
     pub weekend_spread_bps: Option<Decimal>,
+    /// Extra spread (bps) around scheduled US news: inflation (CPI), jobs
+    /// reports and Fed rate decisions, which can move crypto several percent
+    /// in seconds. From `event_before_mins` before each event in
+    /// `events_file` to `event_after_mins` after it. Off when unset.
+    #[serde(default)]
+    pub event_spread_bps: Option<Decimal>,
+    #[serde(default = "default_event_before_mins")]
+    pub event_before_mins: u64,
+    #[serde(default = "default_event_after_mins")]
+    pub event_after_mins: u64,
+    /// The calendar: one "YYYY-MM-DD HH:MM name" per line, New York time.
+    /// Relative to where the bot is started, like `key_file`.
+    #[serde(default = "default_events_file")]
+    pub events_file: PathBuf,
+    /// The events from `events_file` (unix seconds, in order), read at load
+    /// when `event_spread_bps` is set.
+    #[serde(skip)]
+    pub event_times: Vec<i64>,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -243,6 +261,18 @@ fn default_busy_end() -> String {
     "11:30".into()
 }
 
+fn default_event_before_mins() -> u64 {
+    5
+}
+
+fn default_event_after_mins() -> u64 {
+    15
+}
+
+fn default_events_file() -> PathBuf {
+    "events.txt".into()
+}
+
 fn default_channel_secs() -> u64 {
     7200
 }
@@ -280,6 +310,13 @@ pub enum VenueName {
     Hyperliquid,
 }
 
+/// Read the event calendar (see `events_file`).
+fn read_calendar(path: &Path) -> Result<Vec<i64>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the event calendar {}", path.display()))?;
+    crate::clock::parse_calendar(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+}
+
 impl Config {
     /// `--live` on the command line: trade for real without editing the file,
     /// so `bot.toml` never changes and every part's checkout stays clean.
@@ -293,9 +330,12 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let config: Self =
+        let mut config: Self =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         config.validate()?;
+        if config.event_spread_bps.is_some() {
+            config.event_times = read_calendar(&config.events_file)?;
+        }
         Ok(config)
     }
 
@@ -426,6 +466,12 @@ impl Config {
         }
         if self.weekend_spread_bps.is_some_and(|b| b.is_zero()) {
             bail!("a weekend_spread_bps of 0 does nothing; leave it out instead");
+        }
+        if self.event_spread_bps.is_some_and(|b| b <= Decimal::ZERO) {
+            bail!("event_spread_bps must be greater than 0");
+        }
+        if self.event_before_mins + self.event_after_mins == 0 {
+            bail!("event_before_mins and event_after_mins can't both be 0");
         }
         if self.max_total_lean_bps.is_some_and(|b| b <= Decimal::ZERO) {
             bail!("max_total_lean_bps must be greater than 0");
@@ -726,6 +772,29 @@ mod tests {
         config.busy_end = "11:30".into();
         config.busy_spread_bps = Some(Decimal::ZERO);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn scheduled_events_are_off_unless_asked_for() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(config.event_spread_bps, None);
+        assert!(config.event_times.is_empty(), "no calendar read when off");
+        assert_eq!((config.event_before_mins, config.event_after_mins), (5, 15));
+        config.event_spread_bps = Some(Decimal::ONE);
+        assert!(config.validate().is_ok());
+        config.event_spread_bps = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.event_spread_bps = Some(Decimal::ONE);
+        config.event_before_mins = 0;
+        config.event_after_mins = 0;
+        assert!(config.validate().is_err(), "a window of nothing");
+    }
+
+    #[test]
+    fn the_shipped_calendar_reads() {
+        let events = read_calendar(Path::new("events.txt")).unwrap();
+        assert!(events.len() >= 10, "{} events", events.len());
+        assert!(read_calendar(Path::new("no-such-calendar.txt")).is_err());
     }
 
     #[test]

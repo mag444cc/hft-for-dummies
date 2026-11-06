@@ -773,8 +773,24 @@ impl MarketMaker {
         {
             extra += weekend;
         }
+        if let Some(event) = self.config.event_spread_bps
+            && self.near_event(now)
+        {
+            extra += event;
+        }
         // Keep at least 0.1 bps of spread whatever the weekend setting says.
         extra.max(Decimal::new(1, 1) - self.config.spread_bps)
+    }
+
+    /// Within `event_before_mins` before, or `event_after_mins` after, a
+    /// scheduled event from the calendar?
+    fn near_event(&self, now: i64) -> bool {
+        let before = self.config.event_before_mins as i64 * 60;
+        let after = self.config.event_after_mins as i64 * 60;
+        self.config
+            .event_times
+            .iter()
+            .any(|&t| now >= t - before && now < t + after)
     }
 
     /// How this run went so far (for the backtester).
@@ -1589,6 +1605,23 @@ mod tests {
         mm.config.weekend_spread_bps = Some(d("-1"));
         mm.wall_secs = Some(unix_secs);
         mm.spread_bps()
+    }
+
+    #[test]
+    fn wider_around_scheduled_news() {
+        // CPI on Tuesday 2026-11-10 08:30 New York = 13:30 UTC.
+        let cpi = 1_794_009_600 + 3 * 86_400 + 13 * 3600 + 30 * 60;
+        let (mut mm, _) = warmed_up();
+        mm.config.event_spread_bps = Some(d("3"));
+        mm.config.event_times = vec![cpi];
+        let mut at = |secs: i64| {
+            mm.wall_secs = Some(secs);
+            mm.spread_bps()
+        };
+        assert_eq!(at(cpi - 5 * 60 - 1), d("10"), "before the window");
+        assert_eq!(at(cpi - 5 * 60), d("13"), "5 minutes before");
+        assert_eq!(at(cpi + 14 * 60), d("13"), "just after");
+        assert_eq!(at(cpi + 15 * 60), d("10"), "15 minutes after: over");
     }
 
     #[test]

@@ -103,7 +103,9 @@ the sum) or change one side or the skew. None is proven to make money yet: test 
 setting with `backtest --latency-ms` on recordings before running it, and only run
 it live if it helps across coins and days.
 
-- Spread: `vol_spread_mult` (widen in jumpy markets).
+- Spread: `vol_spread_mult` (widen in jumpy markets), `busy_spread_bps` (around the US
+  open, New York time), `weekend_spread_bps`, `event_spread_bps` (around scheduled US
+  news from `events.txt`: CPI, jobs, Fed; keep the calendar's dates up to date).
 - Leans: `momentum_lean` (last second of Binance), `channel_lean_bps` (+ `channel_fade`,
   `channel_scale_by_fit`), `rsi_fast_lean_bps` / `rsi_slow_lean_bps`, `macd_lean_bps`,
   `cvd_short_lean_bps` / `cvd_long_lean_bps` (negative = against the flow),

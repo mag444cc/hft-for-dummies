@@ -68,6 +68,61 @@ pub fn utc_weekend(unix_secs: i64) -> bool {
     weekday(unix_secs.div_euclid(86_400)) >= 5
 }
 
+/// A New York date and time (minutes after midnight) to unix seconds.
+/// Events are never in the 01:00-03:00 hour when the clocks change, so
+/// trying winter time first and checking is enough.
+pub fn new_york_to_unix(y: i64, m: i64, d: i64, minutes: i64) -> i64 {
+    let local = days_from_civil(y, m, d) * 86_400 + minutes * 60;
+    let winter = local + 5 * 3600;
+    if us_daylight_saving(winter) {
+        winter - 3600
+    } else {
+        winter
+    }
+}
+
+/// Read an event calendar: one event per line, "YYYY-MM-DD HH:MM" in New
+/// York time, then anything (its name). Blank lines and lines starting with
+/// '#' are skipped. Returns the events as unix seconds, in order, or the
+/// first line it can't read.
+pub fn parse_calendar(text: &str) -> Result<Vec<i64>, String> {
+    let mut events = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bad = || {
+            format!(
+                "line {}: expected \"YYYY-MM-DD HH:MM name\", got {line:?}",
+                n + 1
+            )
+        };
+        let mut words = line.split_whitespace();
+        let (Some(date), Some(time)) = (words.next(), words.next()) else {
+            return Err(bad());
+        };
+        let parts: Vec<i64> = date
+            .split('-')
+            .map(|p| p.parse().ok())
+            .collect::<Option<_>>()
+            .ok_or_else(bad)?;
+        let [y, m, d] = parts[..] else {
+            return Err(bad());
+        };
+        let minutes = parse_hhmm(time).ok_or_else(bad)?;
+        if !(1..=12).contains(&m)
+            || !(1..=31).contains(&d)
+            || civil(days_from_civil(y, m, d)) != (y, m, d)
+        {
+            return Err(bad());
+        }
+        events.push(new_york_to_unix(y, m, d, minutes));
+    }
+    events.sort_unstable();
+    Ok(events)
+}
+
 /// "HH:MM" to minutes after midnight.
 pub fn parse_hhmm(s: &str) -> Option<i64> {
     let (h, m) = s.split_once(':')?;
@@ -123,5 +178,19 @@ mod tests {
         assert_eq!(parse_hhmm("11:30"), Some(690));
         assert_eq!(parse_hhmm("25:00"), None);
         assert_eq!(parse_hhmm("nine"), None);
+    }
+
+    #[test]
+    fn calendar_times_are_new_york_time() {
+        let text = "# US data\n\n2026-11-10 08:30 CPI (October)\n2026-07-01 08:30 summer\n";
+        let events = parse_calendar(text).unwrap();
+        // Sorted; 08:30 New York is 13:30 UTC in winter, 12:30 in summer.
+        assert_eq!(
+            events,
+            vec![utc(2026, 7, 1, 12, 30), utc(2026, 11, 10, 13, 30)]
+        );
+        assert!(parse_calendar("2026-02-30 08:30 no such day").is_err());
+        assert!(parse_calendar("2026-11-10 8.30 CPI").is_err());
+        assert!(parse_calendar("tomorrow 08:30").is_err());
     }
 }

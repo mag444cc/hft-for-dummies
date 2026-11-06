@@ -1,0 +1,29 @@
+# Scheduled US news that moves crypto: the bot quotes wider around these
+# when a config sets `event_spread_bps` (see README, "Scheduled news").
+#
+# One event per line: date and time in New York time, then a name.
+# Sources (check them and add new dates as they are announced):
+#   CPI and jobs reports: https://www.bls.gov/schedule/
+#   Fed rate decisions:   https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+# The Fed's decision comes at 14:00 and its press conference at 14:30, so
+# both are listed.
+
+2026-11-10 08:30  CPI (October)
+2026-12-04 08:30  Jobs report (November)
+2026-12-09 14:00  Fed rate decision
+2026-12-09 14:30  Fed press conference
+2026-12-10 08:30  CPI (November)
+2027-01-08 08:30  Jobs report (December)
+2027-01-13 08:30  CPI (December)
+2027-01-27 14:00  Fed rate decision
+2027-01-27 14:30  Fed press conference
+2027-02-05 08:30  Jobs report (January)
+2027-02-11 08:30  CPI (January)
+2027-03-05 08:30  Jobs report (February)
+2027-03-10 08:30  CPI (February)
+2027-03-17 14:00  Fed rate decision
+2027-03-17 14:30  Fed press conference
+2027-04-02 08:30  Jobs report (March)
+2027-04-13 08:30  CPI (March)
+2027-04-28 14:00  Fed rate decision
+2027-04-28 14:30  Fed press conference
