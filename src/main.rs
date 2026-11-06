@@ -15,6 +15,7 @@ mod hyperliquid;
 mod hyperliquid_sign;
 mod inventory;
 mod key;
+mod liveness;
 mod market_maker;
 mod strategy;
 mod telemetry;

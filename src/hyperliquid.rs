@@ -43,6 +43,7 @@ use crate::hyperliquid_sign::{
     Cancel, CancelAction, CancelByCloid, CancelByCloidAction, Limit, Modify, ModifyAction,
     OrderAction, OrderType, OrderWire, ScheduleCancelAction, Wallet,
 };
+use crate::liveness::{Liveness, SILENT_AFTER};
 use crate::strategy::Ticks;
 
 /// Hyperliquid refuses orders worth less than this (USD).
@@ -168,6 +169,7 @@ pub async fn connect(config: &Config, bus: Bus) -> Result<Hyperliquid> {
             // Everyone's trades: dry run fills paper orders from these.
             json!({"type": "trades", "coin": coin}),
         ],
+        Some(NO_MARKET_DATA_AFTER),
         bus.clone(),
         move |msg| market_events(msg, &coin),
     );
@@ -179,6 +181,7 @@ pub async fn connect(config: &Config, bus: Bus) -> Result<Hyperliquid> {
                 json!({"type": "orderUpdates", "user": account}),
                 json!({"type": "userFills", "user": account}),
             ],
+            None, // our own orders and fills can be quiet for minutes
             bus,
             move |msg| user_events(msg, &coin),
         );
@@ -747,23 +750,28 @@ fn user_events(msg: &Value, coin: &str) -> Vec<Event> {
     }
 }
 
-/// We ping every second and Hyperliquid answers every ping, so this long
-/// without hearing anything means the connection is dead: reconnect.
-const DEAD_AFTER: Duration = Duration::from_secs(3);
+/// The market feed sends a book every ~5.4 s and trades in between, so this
+/// long without either means it's broken, even if pings are answered. It's
+/// just past `book_stale_secs` (10), when the bot stops quoting: reconnect.
+const NO_MARKET_DATA_AFTER: Duration = Duration::from_secs(12);
 
 /// Keep one websocket open with these subscriptions, forever, and send what
-/// `handle` makes of each message to `bus`. After a drop, sends
+/// `handle` makes of each message to `bus`. We ping every second; see
+/// `liveness.rs` for when we give up on a connection. `data_timeout`: also
+/// reconnect after this long without a message `handle` turns into events
+/// (`None` where quiet is normal). After a drop, sends
 /// [`Event::Reconnecting`] so the bot pulls its quotes and checks its fills.
 fn spawn_socket(
     url: String,
     subscriptions: Vec<Value>,
+    data_timeout: Option<Duration>,
     bus: Bus,
     mut handle: impl FnMut(&Value) -> Vec<Event> + Send + 'static,
 ) {
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match tokio::time::timeout(DEAD_AFTER, connect_async(&url)).await {
+            match tokio::time::timeout(SILENT_AFTER, connect_async(&url)).await {
                 Ok(Ok((mut ws, _))) => {
                     backoff = Duration::from_secs(1);
                     for subscription in &subscriptions {
@@ -771,7 +779,7 @@ fn spawn_socket(
                         let _ = ws.send(Message::Text(msg.to_string().into())).await;
                     }
                     let mut ping = tokio::time::interval(Duration::from_secs(1));
-                    let mut last_heard = Instant::now();
+                    let mut live = Liveness::new(Instant::now(), data_timeout);
                     loop {
                         let msg = tokio::select! {
                             msg = ws.next() => match msg {
@@ -779,8 +787,8 @@ fn spawn_socket(
                                 None => break,
                             },
                             _ = ping.tick() => {
-                                if last_heard.elapsed() > DEAD_AFTER {
-                                    tracing::warn!("hyperliquid: nothing heard for {}s", DEAD_AFTER.as_secs());
+                                if let Some(why) = live.dead(Instant::now()) {
+                                    tracing::warn!("hyperliquid: {why}");
                                     break;
                                 }
                                 let ping = json!({"method": "ping"}).to_string();
@@ -790,14 +798,19 @@ fn spawn_socket(
                                 continue;
                             }
                         };
-                        last_heard = Instant::now();
+                        live.heard(Instant::now(), false);
                         match msg {
                             Ok(Message::Text(text)) => {
                                 let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
                                     tracing::warn!("hyperliquid: bad message: {text}");
                                     continue;
                                 };
-                                for event in handle(&value) {
+                                let events = handle(&value);
+                                // Pongs and subscription answers make no events: not data.
+                                if !events.is_empty() {
+                                    live.heard(Instant::now(), true);
+                                }
+                                for event in events {
                                     if bus.send(event).is_err() {
                                         return; // the bot has shut down
                                     }

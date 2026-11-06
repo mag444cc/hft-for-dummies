@@ -14,6 +14,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::events::{Bus, Event, Stamp};
+use crate::liveness::{Liveness, SILENT_AFTER};
 
 /// The JSON Binance sends. Prices arrive as strings so no precision is lost.
 #[derive(Deserialize)]
@@ -54,20 +55,24 @@ pub fn connect(symbol: &str, bus: Bus) {
 }
 
 /// We ping Binance every second. A healthy connection answers within
-/// milliseconds; hearing nothing at all (no prices, no pong) for this long
-/// means it's dead, even if the operating system hasn't noticed: a wifi blip
-/// or a dropped route can leave a socket half-open for minutes.
-const DEAD_AFTER: Duration = Duration::from_secs(3);
+/// milliseconds; hearing nothing at all (no prices, no pong) for 3 s means
+/// it's dead, even if the operating system hasn't noticed: a wifi blip or a
+/// dropped route can leave a socket half-open for minutes (see `liveness.rs`).
+///
+/// Binance sends prices many times a second, so this long without one means
+/// the feed is broken even if pings are answered. It's also when the bot stops
+/// quoting on a stale price (`reference_stale_secs`), so: reconnect.
+const NO_PRICES_AFTER: Duration = Duration::from_secs(5);
 
 async fn run(url: String, bus: Bus) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match tokio::time::timeout(DEAD_AFTER, connect_async(&url)).await {
+        match tokio::time::timeout(SILENT_AFTER, connect_async(&url)).await {
             Ok(Ok((mut ws, _))) => {
                 tracing::info!("binance: connected");
                 backoff = Duration::from_secs(1);
                 let mut ping = tokio::time::interval(Duration::from_secs(1));
-                let mut last_heard = Instant::now();
+                let mut live = Liveness::new(Instant::now(), Some(NO_PRICES_AFTER));
                 loop {
                     let msg = tokio::select! {
                         msg = ws.next() => match msg {
@@ -75,8 +80,8 @@ async fn run(url: String, bus: Bus) {
                             None => break,
                         },
                         _ = ping.tick() => {
-                            if last_heard.elapsed() > DEAD_AFTER {
-                                tracing::warn!("binance: nothing heard for {}s", DEAD_AFTER.as_secs());
+                            if let Some(why) = live.dead(Instant::now()) {
+                                tracing::warn!("binance: {why}");
                                 break;
                             }
                             if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
@@ -85,7 +90,8 @@ async fn run(url: String, bus: Bus) {
                             continue;
                         }
                     };
-                    last_heard = Instant::now();
+                    // Only a price counts as data; pongs just show we're connected.
+                    live.heard(Instant::now(), matches!(msg, Ok(Message::Text(_))));
                     match msg {
                         Ok(Message::Text(text)) => match parse(&text) {
                             Ok(event) => {
@@ -101,7 +107,7 @@ async fn run(url: String, bus: Bus) {
                             }
                         }
                         Ok(Message::Close(_)) | Err(_) => break,
-                        Ok(_) => {} // pongs: `last_heard` already updated
+                        Ok(_) => {} // pongs: already counted above
                     }
                 }
                 tracing::warn!("binance: disconnected, reconnecting");
