@@ -218,27 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn every_experiment_config_is_valid_and_a_dry_run() {
-        let paths: Vec<_> = std::fs::read_dir("configs/experiment")
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
-            .collect();
-        assert_eq!(paths.len(), 42, "14 setups x SOL, ETH, BTC");
-        for path in paths {
-            let config =
-                Config::load(&path).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
-            assert!(config.dry_run, "{} must be a dry run", path.display());
-            assert_eq!(config.venue, VenueName::Hyperliquid, "{}", path.display());
-            assert!(
-                config.paper_fee_bps.is_some(),
-                "{}: fills must pay a fee",
-                path.display()
-            );
-        }
-    }
-
-    #[test]
     fn several_bots_can_run_at_once() {
         let mut ports = vec![Config::load(Path::new("bot.toml")).unwrap().metrics_port];
         for path in shipped_configs() {

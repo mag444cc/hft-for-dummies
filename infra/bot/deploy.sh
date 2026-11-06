@@ -8,9 +8,6 @@
 #   ./infra/bot/deploy.sh bench    10 minutes of bench-live.toml, then the scoreboard
 #   ./infra/bot/deploy.sh stop     stop the bot (it cancels its orders)
 #   ./infra/bot/deploy.sh chaos binance|bullet   cut one exchange off, time how fast the bot notices
-#   ./infra/bot/deploy.sh experiment [HOURS]  run every configs/experiment bot (dry run), default 8 h
-#   ./infra/bot/deploy.sh results  the experiment's comparison table
-#   ./infra/bot/deploy.sh problems the experiment's warnings and errors
 #   ./infra/bot/deploy.sh destroy  stop and delete the server
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -46,15 +43,9 @@ case "${1:-deploy}" in
     exit ;;
   stop) ssh_bot sudo systemctl stop hft-bot; exit ;;
   chaos) ssh_bot "bash -s $2" <chaos.sh; exit ;;
-  results) ssh_bot python3 - <results.py; exit ;;
-  problems) ssh_bot "journalctl -u 'hft-exp@*' --no-pager -o short-iso | grep -E ' (WARN|ERROR) |loss limit|stale'"; exit ;;
-  destroy)
-    ssh_bot 'sudo systemctl stop hft-bot "hft-exp@*"' || true
-    tf destroy -auto-approve; exit ;;
+  destroy) ssh_bot sudo systemctl stop hft-bot || true; tf destroy -auto-approve; exit ;;
 esac
 
-# Create or update the server, copy the code to it and build it.
-prepare() {
 terraform init -input=false >/dev/null
 tf apply -auto-approve >/dev/null
 ip=$(terraform output -raw ip)
@@ -74,37 +65,6 @@ rsync -az --delete -e "ssh -i .ssh/id_ed25519" \
 
 echo "building (the first build takes a few minutes)..."
 ssh_bot 'cd hft && ~/.cargo/bin/cargo build --release --quiet'
-}
-
-if [ "${1:-}" = experiment ]; then
-  hours=${2:-8}
-  prepare
-  # One service per bot: hft-exp@A-sol runs configs/experiment/A-sol.toml.
-  # systemd restarts a bot that crashes, and stops them all after $hours,
-  # with Ctrl-C (SIGINT) so each logs its final numbers.
-  ssh_bot "sudo tee /etc/systemd/system/hft-exp@.service >/dev/null" <<UNIT
-[Unit]
-Description=hft-for-dummies experiment bot %i
-After=network-online.target
-
-[Service]
-User=ec2-user
-WorkingDirectory=/home/ec2-user/hft
-ExecStart=/home/ec2-user/hft/target/release/hft-for-dummies run configs/experiment/%i.toml
-KillSignal=SIGINT
-TimeoutStopSec=30
-Restart=on-failure
-RestartSec=10
-RuntimeMaxSec=${hours}h
-UNIT
-  ssh_bot 'sudo systemctl daemon-reload && sudo systemctl stop hft-bot
-    for f in hft/configs/experiment/*.toml; do sudo systemctl restart "hft-exp@$(basename "$f" .toml)"; done
-    echo "$(systemctl list-units "hft-exp@*" --state=running --no-legend | wc -l) bots running"'
-  echo "running for $hours hours. See how they do: $0 results"
-  exit
-fi
-
-prepare
 if $live; then
   # bot.toml stays as shipped; the server runs a copy with dry_run off.
   ssh_bot 'cd hft && sed "s/^dry_run = true/dry_run = false/" bot.toml > live.toml && echo CONFIG=live.toml >~/hft-config'
