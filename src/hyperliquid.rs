@@ -7,8 +7,9 @@
 //!   it can trade but can't withdraw. Signing is in `hyperliquid_sign.rs`.
 //! - **Prices.** No fixed tick: up to 5 significant figures (see
 //!   [`Ticks::SignificantFigures`]). Orders must be worth at least $10.
-//! - **The book.** Every message is the whole top of the book, so there is no
-//!   copy to keep in sync (no `book.rs` needed).
+//! - **The book.** Every `l2Book` message is the whole top of the book, so
+//!   there is no copy to keep in sync (no `book.rs` needed). But it comes only
+//!   every ~5.4 s, so the fast `bbo` feed keeps its best bid and ask fresh.
 //! - **Answers.** One request can succeed while single orders in it are
 //!   rejected (a post-only order that would have crossed, say). We report those
 //!   back one by one.
@@ -166,12 +167,17 @@ pub async fn connect(config: &Config, bus: Bus) -> Result<Hyperliquid> {
         ws.clone(),
         vec![
             json!({"type": "l2Book", "coin": coin}),
+            // The best bid and ask, far more often than the full book.
+            json!({"type": "bbo", "coin": coin}),
             // Everyone's trades: dry run fills paper orders from these.
             json!({"type": "trades", "coin": coin}),
         ],
         Some(NO_MARKET_DATA_AFTER),
         bus.clone(),
-        move |msg| market_events(msg, &coin),
+        {
+            let mut market = MarketBook::default();
+            move |msg| market.events(msg, &coin)
+        },
     );
     if let Some(account) = &account {
         let coin = config.symbol.clone();
@@ -637,13 +643,99 @@ struct UserFills {
     fills: Vec<HlFill>,
 }
 
-/// The market socket: the book, or other people's trades.
-fn market_events(msg: &Value, coin: &str) -> Vec<Event> {
-    match msg["channel"].as_str() {
-        Some("l2Book") => book_event(msg, coin).into_iter().collect(),
-        Some("trades") => trade_events(msg, coin),
-        _ => Vec::new(),
+/// The order book as the market socket tells it. Hyperliquid's `l2Book` feed
+/// sends the top 20 levels only about every 5.4 s, but its `bbo` feed sends the
+/// best bid and ask about 12 times a second. So we keep the depth from the
+/// first and the top fresh from the second.
+#[derive(Default)]
+struct MarketBook {
+    /// The last full book and its time (ms since 1970).
+    depth: Book,
+    depth_time: u64,
+    /// The last best bid and ask, and their time.
+    best: Option<Bbo>,
+}
+
+impl MarketBook {
+    /// What one market message means: a fresher book, or trades.
+    fn events(&mut self, msg: &Value, coin: &str) -> Vec<Event> {
+        let time = match msg["channel"].as_str() {
+            Some("l2Book") => {
+                let Some(book) = parse_data::<L2Book>(msg, "book") else {
+                    return Vec::new();
+                };
+                if book.coin != coin {
+                    return Vec::new();
+                }
+                let [bids, asks] = &book.levels;
+                let side = |levels: &[Level]| -> BTreeMap<Decimal, Decimal> {
+                    levels.iter().map(|l| (l.px, l.sz)).collect()
+                };
+                self.depth = Book {
+                    bids: side(bids),
+                    asks: side(asks),
+                };
+                self.depth_time = book.time;
+                book.time
+            }
+            Some("bbo") => {
+                let Some(best) = parse_data::<Bbo>(msg, "bbo") else {
+                    return Vec::new();
+                };
+                if best.coin != coin {
+                    return Vec::new();
+                }
+                let time = best.time;
+                self.best = Some(best);
+                time
+            }
+            Some("trades") => return trade_events(msg, coin),
+            _ => return Vec::new(),
+        };
+        vec![Event::Book(
+            self.book(),
+            Stamp::now(Some(time * 1000), None),
+        )]
     }
+
+    /// The full book with the best bid and ask laid on top, unless the full
+    /// book is newer than them.
+    fn book(&self) -> Book {
+        let mut book = self.depth.clone();
+        let Some(best) = self.best.as_ref().filter(|b| b.time >= self.depth_time) else {
+            return book;
+        };
+        let [bid, ask] = &best.bbo;
+        if let Some(bid) = bid {
+            // Bids above the best bid have been taken or cancelled since.
+            book.bids.retain(|price, _| *price < bid.px);
+            book.bids.insert(bid.px, bid.sz);
+        }
+        if let Some(ask) = ask {
+            book.asks.retain(|price, _| *price > ask.px);
+            book.asks.insert(ask.px, ask.sz);
+        }
+        book
+    }
+}
+
+/// The `data` of a message, or a warning if it can't be read.
+fn parse_data<T: DeserializeOwned>(msg: &Value, what: &str) -> Option<T> {
+    match serde_json::from_value(msg["data"].clone()) {
+        Ok(data) => Some(data),
+        Err(e) => {
+            tracing::warn!("hyperliquid: bad {what} message: {e}");
+            None
+        }
+    }
+}
+
+/// The best bid and ask (either side can be missing).
+#[derive(Deserialize)]
+struct Bbo {
+    coin: String,
+    time: u64,
+    bbo: [Option<Level>; 2],
 }
 
 #[derive(Deserialize)]
@@ -671,34 +763,6 @@ fn trade_events(msg: &Value, coin: &str) -> Vec<Event> {
             stamp: Stamp::now(Some(t.time * 1000), Some(t.time * 1000)),
         })
         .collect()
-}
-
-/// A book message: the whole top of the book, every time.
-fn book_event(msg: &Value, coin: &str) -> Option<Event> {
-    if msg["channel"] != "l2Book" {
-        return None;
-    }
-    let book: L2Book = match serde_json::from_value(msg["data"].clone()) {
-        Ok(book) => book,
-        Err(e) => {
-            tracing::warn!("hyperliquid: bad book message: {e}");
-            return None;
-        }
-    };
-    if book.coin != coin {
-        return None;
-    }
-    let [bids, asks] = &book.levels;
-    let side = |levels: &[Level]| -> BTreeMap<Decimal, Decimal> {
-        levels.iter().map(|l| (l.px, l.sz)).collect()
-    };
-    Some(Event::Book(
-        Book {
-            bids: side(bids),
-            asks: side(asks),
-        },
-        Stamp::now(Some(book.time * 1000), None),
-    ))
 }
 
 /// News about our own orders and fills.
@@ -750,9 +814,10 @@ fn user_events(msg: &Value, coin: &str) -> Vec<Event> {
     }
 }
 
-/// The market feed sends a book every ~5.4 s and trades in between, so this
-/// long without either means it's broken, even if pings are answered. It's
-/// just past `book_stale_secs` (10), when the bot stops quoting: reconnect.
+/// The market feed sends the best bid and ask several times a second, a full
+/// book every ~5.4 s and trades in between, so this long without any of them
+/// means it's broken, even if pings are answered. It's just past
+/// `book_stale_secs` (10), when the bot stops quoting: reconnect.
 const NO_MARKET_DATA_AFTER: Duration = Duration::from_secs(12);
 
 /// Keep one websocket open with these subscriptions, forever, and send what
@@ -869,23 +934,104 @@ mod tests {
         assert_eq!(number(d("0.05")), "0.05");
     }
 
+    /// A full book: bids 100.1 (5) and 100.0 (2), asks 100.2 (3) and 100.3 (1).
+    fn l2(time: u64) -> Value {
+        parse(&format!(
+            r#"{{"channel":"l2Book","data":{{"coin":"SOL","time":{time},"levels":[
+                [{{"px":"100.1","sz":"5","n":1}},{{"px":"100.0","sz":"2","n":1}}],
+                [{{"px":"100.2","sz":"3","n":2}},{{"px":"100.3","sz":"1","n":1}}]]}}}}"#
+        ))
+    }
+
+    fn bbo(time: u64, bid: &str, ask: &str) -> Value {
+        parse(&format!(
+            r#"{{"channel":"bbo","data":{{"coin":"SOL","time":{time},"bbo":[
+                {{"px":"{bid}","sz":"1","n":1}},{{"px":"{ask}","sz":"9","n":1}}]}}}}"#
+        ))
+    }
+
+    /// Price and size, best first.
+    type Levels = Vec<(Decimal, Decimal)>;
+
+    /// The book each message makes, as (bids, asks) best first.
+    fn book_after(market: &mut MarketBook, msg: &Value) -> (Levels, Levels) {
+        let events = market.events(msg, "SOL");
+        let [Event::Book(book, _)] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        (
+            book.bids.iter().rev().map(|(p, s)| (*p, *s)).collect(),
+            book.asks.iter().map(|(p, s)| (*p, *s)).collect(),
+        )
+    }
+
     #[test]
-    fn reads_the_book() {
-        let msg = parse(
-            r#"{"channel":"l2Book","data":{"coin":"SOL","time":1700000000000,"levels":[
-                [{"px":"100.1","sz":"5","n":1},{"px":"100.0","sz":"2","n":1}],
-                [{"px":"100.2","sz":"3","n":2}]]}}"#,
-        );
-        let Some(Event::Book(book, stamp)) = book_event(&msg, "SOL") else {
-            panic!()
+    fn reads_the_full_book() {
+        let mut market = MarketBook::default();
+        let events = market.events(&l2(1_700_000_000_000), "SOL");
+        let [Event::Book(book, stamp)] = events.as_slice() else {
+            panic!("{events:?}")
         };
         assert_eq!(
             (book.best_bid(), book.best_ask()),
             (Some(d("100.1")), Some(d("100.2")))
         );
         assert_eq!(stamp.exchange_unix_us, Some(1_700_000_000_000_000));
-        assert!(book_event(&msg, "ETH").is_none(), "another coin's book");
-        assert!(book_event(&parse(r#"{"channel":"pong"}"#), "SOL").is_none());
+        assert!(
+            market.events(&l2(1), "ETH").is_empty(),
+            "another coin's book"
+        );
+        assert!(
+            market
+                .events(&parse(r#"{"channel":"pong"}"#), "SOL")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_fast_feed_keeps_the_top_fresh_and_the_depth() {
+        let mut market = MarketBook::default();
+        market.events(&l2(10), "SOL");
+        // Someone bids 100.15, the best ask grows: deeper levels stay.
+        let (bids, asks) = book_after(&mut market, &bbo(20, "100.15", "100.2"));
+        assert_eq!(
+            bids,
+            vec![
+                (d("100.15"), d("1")),
+                (d("100.1"), d("5")),
+                (d("100.0"), d("2"))
+            ]
+        );
+        assert_eq!(asks, vec![(d("100.2"), d("9")), (d("100.3"), d("1"))]);
+    }
+
+    #[test]
+    fn levels_better_than_the_new_best_are_gone() {
+        let mut market = MarketBook::default();
+        market.events(&l2(10), "SOL");
+        // The 100.1 bids and the 100.2 asks were taken: the best moved out.
+        let (bids, asks) = book_after(&mut market, &bbo(20, "100.0", "100.3"));
+        assert_eq!(bids, vec![(d("100.0"), d("1"))]);
+        assert_eq!(asks, vec![(d("100.3"), d("9"))]);
+    }
+
+    #[test]
+    fn an_older_full_book_keeps_the_newer_top() {
+        let mut market = MarketBook::default();
+        market.events(&bbo(30, "100.15", "100.25"), "SOL");
+        let (bids, asks) = book_after(&mut market, &l2(20));
+        assert_eq!(bids[0], (d("100.15"), d("1")), "the newer best bid stays");
+        assert_eq!(asks[0], (d("100.25"), d("9")));
+        assert_eq!(asks[1], (d("100.3"), d("1")), "depth from the full book");
+    }
+
+    #[test]
+    fn the_fast_feed_alone_is_a_book_too() {
+        let mut market = MarketBook::default();
+        let (bids, asks) = book_after(&mut market, &bbo(5, "100.1", "100.2"));
+        assert_eq!((bids.len(), asks.len()), (1, 1));
+        let other = parse(r#"{"channel":"bbo","data":{"coin":"ETH","time":1,"bbo":[null,null]}}"#);
+        assert!(market.events(&other, "SOL").is_empty());
     }
 
     #[test]
@@ -895,7 +1041,7 @@ mod tests {
                 {"coin":"SOL","side":"A","px":"90.218","sz":"0.18","time":1793925611003,"hash":"0x0","tid":1,"users":["0x1","0x2"]},
                 {"coin":"ETH","side":"B","px":"2240","sz":"1","time":1793925611004,"hash":"0x0","tid":2,"users":["0x1","0x2"]}]}"#,
         );
-        let events = market_events(&msg, "SOL");
+        let events = MarketBook::default().events(&msg, "SOL");
         let [Event::Trade { price, size, stamp }] = events.as_slice() else {
             panic!("{events:?}")
         };
