@@ -73,6 +73,10 @@ appears.
 ```sh
 cargo run                     # run (dry run by default, reads bot.toml)
 cargo run -- keygen           # make bot.key for live trading
+cargo run -- record <config> <out.jsonl>            # record the market a config quotes
+cargo run -- backtest <rec.jsonl> <configs or folder> --latency-ms 150
+                              # replay it through configs; use a realistic order
+                              # delay, or every strategy looks better than it is
 cargo test                    # after every change
 cargo fmt && cargo clippy --all-targets -- -D warnings   # before every commit (CI runs both)
 ```
@@ -86,6 +90,28 @@ Event-driven, the same shape as the bullet-bots harness, kept small:
 - An `Executor` (`executor.rs`) carries intents out and reports results back as events. Live and paper implement the same trait.
   The live one talks to an exchange through the `Venue` trait, which Bullet and Hyperliquid implement.
 - `bot.rs` only wires and runs the loop.
+- Extra feeds, each only started when a config asks for it: `bybit.rs` (second price
+  reference), `flow.rs` (Binance perp and Bybit spot trades, for CVD).
+- Signals the market maker keeps itself, from Binance's price: `volatility.rs`,
+  `momentum.rs`, `channel.rs` (two-hour trendline), `indicators.rs` (RSI, MACD on its
+  own candles), `flow::Cvd`. `recording.rs` + `backtest.rs` replay recorded markets.
+
+### Optional strategy settings (all off unless set in a config)
+
+They either shift fair value (the "leans", which add up; `max_total_lean_bps` caps
+the sum) or change one side or the skew. None is proven to make money yet: test a
+setting with `backtest --latency-ms` on recordings before running it, and only run
+it live if it helps across coins and days.
+
+- Spread: `vol_spread_mult` (widen in jumpy markets).
+- Leans: `momentum_lean` (last second of Binance), `channel_lean_bps` (+ `channel_fade`,
+  `channel_scale_by_fit`), `rsi_fast_lean_bps` / `rsi_slow_lean_bps`, `macd_lean_bps`,
+  `cvd_short_lean_bps` / `cvd_long_lean_bps` (negative = against the flow),
+  `cvd_spot_lead_bps`, `cvd_agree_bps`, `cvd_divergence`; capped by `max_total_lean_bps`.
+- Position handling: `fill_imbalance_bps` (push the side that keeps getting hit
+  away), `big_move_bps` (no skew after a big move against us), `channel_hold`.
+- Binance splits its futures streams: book streams (bookTicker) under `/public`,
+  trades and liquidations under `/market`; the old `/ws` path no longer carries trades.
 
 Each series part should change one box and leave the others alone. When a part
 needs a new capability, add an event, intent, or executor, not a special case
