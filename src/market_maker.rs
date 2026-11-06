@@ -458,16 +458,34 @@ impl MarketMaker {
     /// back up); near the upper edge: down. Full lean two typical distances
     /// from the line; none once the channel has broken.
     fn channel_shift_bps(&self) -> Decimal {
-        let (Some(max), Some(channel)) = (self.config.channel_lean_bps, &self.channel) else {
+        let (Some(_), Some(channel)) = (self.config.channel_lean_bps, &self.channel) else {
             return Decimal::ZERO;
         };
-        match channel.position() {
-            Some(p) if p.fit >= self.config.channel_fit && p.distance.abs() <= channel::BROKEN => {
-                let towards_line = (-p.distance / 2.0).clamp(-1.0, 1.0);
-                (max * Decimal::from_f64(towards_line).unwrap_or_default()).round_dp(4)
-            }
-            _ => Decimal::ZERO,
+        channel
+            .position()
+            .map_or(Decimal::ZERO, |p| self.channel_shift_for(p))
+    }
+
+    fn channel_shift_for(&self, p: channel::Position) -> Decimal {
+        let Some(max) = self.config.channel_lean_bps else {
+            return Decimal::ZERO;
+        };
+        let min_fit = self.config.channel_fit;
+        if p.fit < min_fit || p.distance.abs() > channel::BROKEN {
+            return Decimal::ZERO;
         }
+        let mut towards_line = (-p.distance / 2.0).clamp(-1.0, 1.0);
+        // Fade out between two typical distances and the break, instead of
+        // dropping from the full lean to none at the break.
+        if self.config.channel_fade && p.distance.abs() > 2.0 {
+            towards_line *= (channel::BROKEN - p.distance.abs()) / (channel::BROKEN - 2.0);
+        }
+        // Cleaner channels lean harder: half the lean at the minimum fit,
+        // all of it for a perfect line.
+        if self.config.channel_scale_by_fit {
+            towards_line *= 0.5 + 0.5 * ((p.fit - min_fit) / (1.0 - min_fit)).clamp(0.0, 1.0);
+        }
+        (max * Decimal::from_f64(towards_line).unwrap_or_default()).round_dp(4)
     }
 
     /// Position handling on top of the plain quote (see `fill_imbalance_bps`
@@ -1054,6 +1072,51 @@ mod tests {
             channel_lean_at(100.5),
             Decimal::ZERO,
             "a broken channel: no lean"
+        );
+    }
+
+    /// The channel lean (max 2 bps) for a price at `distance` in a channel of `fit`.
+    fn lean_with(fade: bool, by_fit: bool, distance: f64, fit: f64) -> Decimal {
+        let (mut mm, _) = warmed_up();
+        mm.config.channel_lean_bps = Some(d("2"));
+        mm.config.channel_fade = fade;
+        mm.config.channel_scale_by_fit = by_fit;
+        mm.channel_shift_for(channel::Position { fit, distance })
+    }
+
+    #[test]
+    fn the_channel_lean_can_fade_before_the_break() {
+        // 2.5 typical distances below the line: full lean without the fade,
+        // half of it with (half way from 2 to the break at 3).
+        assert_eq!(lean_with(false, false, -2.5, 0.9), d("2"));
+        assert_eq!(lean_with(true, false, -2.5, 0.9), d("1"));
+        assert_eq!(
+            lean_with(true, false, -1.0, 0.9),
+            d("1"),
+            "no fade inside 2"
+        );
+        assert_eq!(lean_with(true, false, 3.5, 0.9), Decimal::ZERO, "broken");
+    }
+
+    #[test]
+    fn cleaner_channels_can_lean_harder() {
+        // At the lower edge (1 typical distance): 1 bps plain.
+        assert_eq!(lean_with(false, false, -1.0, 0.7), d("1"));
+        assert_eq!(
+            lean_with(false, true, -1.0, 0.7),
+            d("0.5"),
+            "minimum fit: half"
+        );
+        assert_eq!(lean_with(false, true, -1.0, 0.85), d("0.75"));
+        assert_eq!(
+            lean_with(false, true, -1.0, 1.0),
+            d("1"),
+            "perfect line: all"
+        );
+        assert_eq!(
+            lean_with(false, true, -1.0, 0.6),
+            Decimal::ZERO,
+            "too messy"
         );
     }
 

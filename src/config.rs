@@ -89,6 +89,14 @@ pub struct Config {
     pub channel_secs: u64,
     #[serde(default = "default_channel_fit")]
     pub channel_fit: f64,
+    /// Fade the channel lean out between two typical distances from the
+    /// line and the break (three), instead of stopping it all at once.
+    #[serde(default)]
+    pub channel_fade: bool,
+    /// Lean harder in cleaner channels: half of `channel_lean_bps` at the
+    /// minimum `channel_fit`, all of it for a perfect line.
+    #[serde(default)]
+    pub channel_scale_by_fit: bool,
     /// Only replace a resting quote once fair value has moved this far from it (bps).
     pub requote_threshold_bps: Decimal,
     /// And never more often than this...
@@ -430,6 +438,7 @@ mod tests {
         let mut config = Config::load(Path::new("bot.toml")).unwrap();
         assert_eq!(config.channel_lean_bps, None);
         assert_eq!((config.channel_secs, config.channel_fit), (7200, 0.7));
+        assert!(!config.channel_fade && !config.channel_scale_by_fit);
         config.channel_lean_bps = Some(Decimal::ZERO);
         assert!(config.validate().is_err());
         config.channel_lean_bps = Some(Decimal::TWO);
