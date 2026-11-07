@@ -227,6 +227,7 @@ impl MarketMaker {
             Event::SecondReference { bid, ask, stamp } => {
                 self.fair.on_bybit(*bid, *ask, stamp.received_at)
             }
+            Event::History(closes) => self.load_history(closes, now),
             Event::Book(book, _) => {
                 if let Some(mid) = book.mid() {
                     self.fair
@@ -527,7 +528,8 @@ impl MarketMaker {
         let mut shift = self.momentum_shift_bps()
             + self.channel_shift_bps()
             + self.indicator_shift_bps(now)
-            + self.cvd_shift_bps(now);
+            + self.cvd_shift_bps(now)
+            + self.book_shift_bps();
         if let Some(cap) = self.config.max_total_lean_bps {
             shift = shift.clamp(-cap, cap);
         }
@@ -535,6 +537,81 @@ impl MarketMaker {
             return fair;
         }
         fair * (Decimal::ONE + shift / Decimal::from(10_000))
+    }
+
+    /// Rebuild the slow signals (channel, RSI and MACD candles) from past
+    /// 1-minute closes, oldest first, as (seconds ago, close). They start
+    /// fresh: the few seconds of live prices they had are dropped, so the
+    /// prices stay in time order. Points from before this machine started
+    /// can't be placed on its clock and are skipped.
+    fn load_history(&mut self, closes: &[(u64, Decimal)], now: Instant) {
+        let candles =
+            |on: bool, secs: u64| on.then(|| Candles::new(Duration::from_secs(secs), 120));
+        let mut channel = self
+            .config
+            .channel_lean_bps
+            .map(|_| Channel::new(Duration::from_secs(self.config.channel_secs)));
+        let mut rsi_fast = candles(self.rsi_fast.is_some(), self.config.rsi_fast_secs);
+        let mut rsi_slow = candles(self.rsi_slow.is_some(), self.config.rsi_slow_secs);
+        let mut macd = candles(self.macd_candles.is_some(), self.config.macd_secs);
+        for (ago, close) in closes {
+            let (Some(at), Some(price)) =
+                (now.checked_sub(Duration::from_secs(*ago)), close.to_f64())
+            else {
+                continue;
+            };
+            if let Some(c) = &mut channel {
+                c.on_price(price, at);
+            }
+            for c in [&mut rsi_fast, &mut rsi_slow, &mut macd]
+                .into_iter()
+                .flatten()
+            {
+                c.on_price(price, at);
+            }
+        }
+        if channel.is_some() {
+            self.channel = channel;
+        }
+        if rsi_fast.is_some() {
+            self.rsi_fast = rsi_fast;
+        }
+        if rsi_slow.is_some() {
+            self.rsi_slow = rsi_slow;
+        }
+        if macd.is_some() {
+            self.macd_candles = macd;
+        }
+    }
+
+    /// With `book_lean_bps`: lean toward the side of the venue's own book
+    /// with less size behind it. When far more is waiting to sell than to
+    /// buy, the next tick is more often down. Our own resting orders are left
+    /// out, so the bot doesn't lean on itself.
+    fn book_shift_bps(&self) -> Decimal {
+        let (Some(bps), Some((book, _))) = (self.config.book_lean_bps, &self.book) else {
+            return Decimal::ZERO;
+        };
+        let levels = self.config.book_lean_levels as usize;
+        let ours = |order: &Option<Order>, price: &Decimal| {
+            order
+                .as_ref()
+                .filter(|o| o.price == *price)
+                .map_or(Decimal::ZERO, |o| o.size)
+        };
+        let side_size = |levels_iter: Vec<(&Decimal, &Decimal)>, order: &Option<Order>| {
+            levels_iter
+                .into_iter()
+                .map(|(price, size)| (*size - ours(order, price)).max(Decimal::ZERO))
+                .sum::<Decimal>()
+        };
+        let bids = side_size(book.bids.iter().rev().take(levels).collect(), &self.bid);
+        let asks = side_size(book.asks.iter().take(levels).collect(), &self.ask);
+        let total = bids + asks;
+        if total.is_zero() {
+            return Decimal::ZERO;
+        }
+        bps * (bids - asks) / total
     }
 
     /// The CVD leans: with (or, for negative settings, against) who has
@@ -1554,6 +1631,69 @@ mod tests {
         );
         mm.cvd = Some(cvd);
         mm.cvd_shift_bps(now)
+    }
+
+    #[test]
+    fn past_prices_fill_the_slow_signals_at_startup() {
+        let (mut mm, now) = warmed_up();
+        // Short windows so the test needs only 20 minutes of past prices:
+        // 1-minute RSI candles and a 10-minute channel.
+        mm.config.rsi_slow_lean_bps = Some(d("2"));
+        mm.config.rsi_slow_secs = 60;
+        mm.rsi_slow = Some(Candles::new(Duration::from_secs(60), 120));
+        mm.config.channel_lean_bps = Some(d("2"));
+        mm.config.channel_secs = 600;
+        mm.channel = Some(Channel::new(Duration::from_secs(600)));
+        // 20 minutes of 1-minute closes, falling steadily.
+        let closes: Vec<(u64, Decimal)> = (1..=20u64)
+            .rev()
+            .map(|m| {
+                (
+                    m * 60,
+                    Decimal::from(100) + Decimal::from(m) / Decimal::from(10),
+                )
+            })
+            .collect();
+        // Past prices can't be placed before this machine started.
+        if now.checked_sub(Duration::from_secs(20 * 60)).is_none() {
+            return;
+        }
+        assert_eq!(
+            mm.rsi_slow.as_ref().unwrap().closes().len(),
+            0,
+            "empty before"
+        );
+        mm.on_event(&Event::History(closes), now);
+        let rsi = indicators::rsi(mm.rsi_slow.as_ref().unwrap().closes(), 14).unwrap();
+        assert!(rsi < 30.0, "20 minutes of falling prices: {rsi}");
+        assert!(
+            mm.channel.as_ref().unwrap().position().is_some(),
+            "the channel is full"
+        );
+    }
+
+    #[test]
+    fn fair_value_leans_toward_the_thin_side_of_the_book() {
+        let (mut mm, now) = warmed_up();
+        mm.config.book_lean_bps = Some(d("2"));
+        mm.config.book_lean_levels = 1;
+        // 10 to buy at the best bid, 30 to sell at the best ask: sellers are
+        // heavier, so the price is more likely to tick down. Imbalance -0.5.
+        let book = Book::from_levels(&[(d("99.5"), d("10"))], &[(d("100.5"), d("30"))]);
+        mm.book = Some((book, now));
+        assert_eq!(mm.lean_with_binance(d("100"), now), d("99.99"), "-1 bps");
+        // Our own 20 resting at the best ask don't count: 10 vs 10, no lean.
+        mm.ask = Some(Order {
+            side: Side::Sell,
+            price: d("100.5"),
+            size: d("20"),
+            client_id: 7,
+        });
+        assert_eq!(mm.lean_with_binance(d("100"), now), d("100"));
+        // Off by default.
+        mm.config.book_lean_bps = None;
+        mm.ask = None;
+        assert_eq!(mm.lean_with_binance(d("100"), now), d("100"));
     }
 
     #[test]

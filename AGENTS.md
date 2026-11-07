@@ -94,7 +94,9 @@ Event-driven, the same shape as the bullet-bots harness, kept small:
   reference), `flow.rs` (Binance perp and Bybit spot trades, for CVD).
 - Signals the market maker keeps itself, from Binance's price: `volatility.rs`,
   `momentum.rs`, `channel.rs` (two-hour trendline), `indicators.rs` (RSI, MACD on its
-  own candles), `flow::Cvd`. `recording.rs` + `backtest.rs` replay recorded markets.
+  own candles), `flow::Cvd`. `history.rs` loads a day of past 1-minute prices at startup
+  (Binance, else Hyperliquid) when a slow lean is on, so channel/RSI/MACD work right after
+  a restart. `recording.rs` + `backtest.rs` replay recorded markets.
 
 ### Optional strategy settings (all off unless set in a config)
 
@@ -106,7 +108,8 @@ it live if it helps across coins and days.
 - Spread: `vol_spread_mult` (widen in jumpy markets), `busy_spread_bps` (around the US
   open, New York time), `weekend_spread_bps`, `event_spread_bps` (around scheduled US
   news from `events.txt`: CPI, jobs, Fed; keep the calendar's dates up to date).
-- Leans: `momentum_lean` (last second of Binance), `channel_lean_bps` (+ `channel_fade`,
+- Leans: `momentum_lean` (last second of Binance), `book_lean_bps` (toward the thin side
+  of the venue's own book), `channel_lean_bps` (+ `channel_fade`,
   `channel_scale_by_fit`), `rsi_fast_lean_bps` / `rsi_slow_lean_bps`, `macd_lean_bps`,
   `cvd_short_lean_bps` / `cvd_long_lean_bps` (negative = against the flow),
   `cvd_spot_lead_bps`, `cvd_agree_bps`, `cvd_divergence`; capped by `max_total_lean_bps`.

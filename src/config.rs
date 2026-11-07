@@ -176,6 +176,14 @@ pub struct Config {
     /// signal). Needs `cvd_spot_symbol`. Off when unset.
     #[serde(default)]
     pub cvd_agree_bps: Option<Decimal>,
+    /// Lean fair value this many bps toward the thin side of the venue's own
+    /// book: (bid size - ask size) / (bid size + ask size) over the top
+    /// `book_lean_levels` levels, our own orders left out. Fills on a thin
+    /// side were worse in run 2. Off when unset.
+    #[serde(default)]
+    pub book_lean_bps: Option<Decimal>,
+    #[serde(default = "default_book_lean_levels")]
+    pub book_lean_levels: u32,
     /// The most all the fair-value leans together (momentum, channel, RSI,
     /// MACD, CVD) may shift fair value, either way, in bps: when many point
     /// the same way they add up, and past the spread the bot would be betting
@@ -260,6 +268,10 @@ fn default_momentum_ms() -> u64 {
 
 fn default_fill_imbalance_secs() -> u64 {
     60
+}
+
+fn default_book_lean_levels() -> u32 {
+    1
 }
 
 fn default_jump_ms() -> u64 {
@@ -412,6 +424,12 @@ impl Config {
         }
         if self.fill_imbalance_bps.is_some() && self.fill_imbalance_secs == 0 {
             bail!("fill_imbalance_secs must be greater than 0");
+        }
+        if self.book_lean_bps.is_some_and(|b| b.is_zero()) {
+            bail!("a book_lean_bps of 0 does nothing; leave it out instead");
+        }
+        if !(1..=20).contains(&self.book_lean_levels) {
+            bail!("book_lean_levels must be 1 to 20 (Bullet sends the top 20)");
         }
         if self.jump_bps.is_some_and(|b| b <= Decimal::ZERO) {
             bail!("jump_bps must be greater than 0");
@@ -691,6 +709,19 @@ mod tests {
         config.momentum_lean = Some(Decimal::ONE);
         assert!(config.validate().is_ok());
         config.momentum_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn the_book_lean_is_off_unless_asked_for() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!((config.book_lean_bps, config.book_lean_levels), (None, 1));
+        config.book_lean_bps = Some(Decimal::ONE);
+        assert!(config.validate().is_ok());
+        config.book_lean_bps = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.book_lean_bps = Some(Decimal::ONE);
+        config.book_lean_levels = 0;
         assert!(config.validate().is_err());
     }
 

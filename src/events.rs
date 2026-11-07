@@ -73,6 +73,10 @@ pub enum Event {
         sell: Decimal,
         stamp: Stamp,
     },
+    /// Binance's 1-minute closes from before we started, oldest first, each
+    /// as (seconds ago, close), so the slow signals don't start empty
+    /// (see `history.rs`).
+    History(Vec<(u64, Decimal)>),
     /// One of our orders (partly) filled.
     Fill(Fill),
     /// One of our orders left the book without filling (cancelled or rejected).

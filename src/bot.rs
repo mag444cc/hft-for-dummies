@@ -23,7 +23,7 @@ use crate::executor::{Executor, LiveExecutor, PaperExecutor, Venue};
 use crate::market_maker::MarketMaker;
 use crate::strategy::Ticks;
 use crate::telemetry::{self, Telemetry};
-use crate::{binance, bullet, bybit, flow, hyperliquid};
+use crate::{binance, bullet, bybit, flow, history, hyperliquid};
 
 pub async fn run(config_path: &Path, live: bool) -> Result<()> {
     let config = Config::load(config_path)?.live(live);
@@ -79,6 +79,9 @@ async fn trade(
             config.cvd_spot_symbol.as_deref(),
             bus.clone(),
         );
+    }
+    if history::needed(&config) {
+        history::fetch(&config.binance_symbol, bus.clone());
     }
     spawn_timer(bus.clone());
     spawn_ctrl_c(bus.clone());

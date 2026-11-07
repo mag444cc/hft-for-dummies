@@ -16,6 +16,7 @@ mod events;
 mod executor;
 mod fair_value;
 mod flow;
+mod history;
 mod hyperliquid;
 mod hyperliquid_sign;
 mod indicators;
