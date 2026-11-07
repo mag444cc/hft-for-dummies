@@ -111,7 +111,8 @@ it live if it helps across coins and days.
   `cvd_short_lean_bps` / `cvd_long_lean_bps` (negative = against the flow),
   `cvd_spot_lead_bps`, `cvd_agree_bps`, `cvd_divergence`; capped by `max_total_lean_bps`.
 - Position handling: `fill_imbalance_bps` (push the side that keeps getting hit
-  away), `big_move_bps` (no skew after a big move against us), `channel_hold`.
+  away), `big_move_bps` (no skew after a big move against us), `channel_hold`,
+  `jump_bps` (after a fast Binance move, step back the side it heads for).
 - Binance splits its futures streams: book streams (bookTicker) under `/public`,
   trades and liquidations under `/market`; the old `/ws` path no longer carries trades.
 

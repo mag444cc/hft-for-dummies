@@ -78,6 +78,19 @@ pub struct Config {
     pub big_move_bps: Option<Decimal>,
     #[serde(default = "default_big_move_secs")]
     pub big_move_secs: u64,
+    /// After Binance moves at least this many bps within `jump_ms`, move the
+    /// side the move is heading for (our ask when Binance rises, our bid when
+    /// it falls) `jump_widen_bps` further out for `jump_hold_secs`. Fills
+    /// right after a Binance jump were the worst ones in run 2 (about -5 bps
+    /// a minute later on Hyperliquid). Off when unset.
+    #[serde(default)]
+    pub jump_bps: Option<Decimal>,
+    #[serde(default = "default_jump_ms")]
+    pub jump_ms: u64,
+    #[serde(default = "default_jump_widen_bps")]
+    pub jump_widen_bps: Decimal,
+    #[serde(default = "default_jump_hold_secs")]
+    pub jump_hold_secs: u64,
     /// If Binance has moved in a clean channel over the last `channel_secs`
     /// (a straight-line fit explains at least `channel_fit` of the moves,
     /// 0 to 1), lean both quotes up to this many bps towards the line: up
@@ -249,6 +262,18 @@ fn default_fill_imbalance_secs() -> u64 {
     60
 }
 
+fn default_jump_ms() -> u64 {
+    2000
+}
+
+fn default_jump_widen_bps() -> Decimal {
+    Decimal::new(5, 0)
+}
+
+fn default_jump_hold_secs() -> u64 {
+    10
+}
+
 fn default_big_move_secs() -> u64 {
     300
 }
@@ -387,6 +412,18 @@ impl Config {
         }
         if self.fill_imbalance_bps.is_some() && self.fill_imbalance_secs == 0 {
             bail!("fill_imbalance_secs must be greater than 0");
+        }
+        if self.jump_bps.is_some_and(|b| b <= Decimal::ZERO) {
+            bail!("jump_bps must be greater than 0");
+        }
+        if self.jump_bps.is_some()
+            && (self.jump_ms == 0
+                || self.jump_hold_secs == 0
+                || self.jump_widen_bps <= Decimal::ZERO)
+        {
+            bail!(
+                "with jump_bps, jump_ms, jump_hold_secs and jump_widen_bps must be greater than 0"
+            );
         }
         if self.big_move_bps.is_some_and(|b| b <= Decimal::ZERO) {
             bail!("big_move_bps must be greater than 0");
@@ -654,6 +691,24 @@ mod tests {
         config.momentum_lean = Some(Decimal::ONE);
         assert!(config.validate().is_ok());
         config.momentum_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn the_jump_step_back_is_off_unless_asked_for() {
+        let mut config = Config::load(Path::new("bot.toml")).unwrap();
+        assert_eq!(config.jump_bps, None);
+        assert_eq!((config.jump_ms, config.jump_hold_secs), (2000, 10));
+        assert_eq!(config.jump_widen_bps, Decimal::new(5, 0));
+        config.jump_bps = Some(Decimal::new(3, 0));
+        assert!(config.validate().is_ok());
+        config.jump_bps = Some(Decimal::ZERO);
+        assert!(config.validate().is_err());
+        config.jump_bps = Some(Decimal::new(3, 0));
+        config.jump_hold_secs = 0;
+        assert!(config.validate().is_err(), "a step back of no time");
+        config.jump_hold_secs = 10;
+        config.jump_widen_bps = Decimal::ZERO;
         assert!(config.validate().is_err());
     }
 

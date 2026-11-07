@@ -59,6 +59,10 @@ pub struct MarketMaker {
     channel: Option<Channel>,
     /// Binance's move over `big_move_secs` (only with `big_move_bps`).
     big_move: Option<Momentum>,
+    /// Binance's move over `jump_ms` (only with `jump_bps`).
+    jump: Option<Momentum>,
+    /// After a Binance jump: which of our sides steps back, and until when.
+    jump_side: Option<(Side, Instant)>,
     /// Candles of Binance's price for the indicator leans (each only when
     /// its setting is on).
     rsi_fast: Option<Candles>,
@@ -116,6 +120,9 @@ impl MarketMaker {
         let big_move = config
             .big_move_bps
             .map(|_| Momentum::new(Duration::from_secs(config.big_move_secs)));
+        let jump = config
+            .jump_bps
+            .map(|_| Momentum::new(Duration::from_millis(config.jump_ms)));
         let channel = config
             .channel_lean_bps
             .map(|_| Channel::new(Duration::from_secs(config.channel_secs)));
@@ -135,6 +142,8 @@ impl MarketMaker {
             volatility,
             momentum,
             big_move,
+            jump,
+            jump_side: None,
             channel,
             recent_fills: VecDeque::new(),
             holding_since: None,
@@ -193,6 +202,7 @@ impl MarketMaker {
                 if let Some(big_move) = &mut self.big_move {
                     big_move.on_price(mid, stamp.received_at);
                 }
+                self.watch_for_jumps(mid, stamp.received_at);
                 if let Some(channel) = &mut self.channel {
                     channel.on_price(mid.to_f64().unwrap_or(0.0), stamp.received_at);
                 }
@@ -729,6 +739,15 @@ impl MarketMaker {
                 adjust.ask_bps = bps * (-lopsided).max(Decimal::ZERO);
             }
         }
+        if let Some((side, until)) = self.jump_side
+            && now < until
+        {
+            let widen = self.config.jump_widen_bps;
+            match side {
+                Side::Buy => adjust.bid_bps += widen,
+                Side::Sell => adjust.ask_bps += widen,
+            }
+        }
         adjust.skew = self.hold_skew(now);
         if let (Some(limit), Some(big_move)) = (self.config.big_move_bps, &self.big_move)
             && let Some(moved) = big_move.move_bps()
@@ -741,6 +760,29 @@ impl MarketMaker {
             }
         }
         adjust
+    }
+
+    /// With `jump_bps`: when Binance has just moved that far within
+    /// `jump_ms`, the venue usually follows over the next seconds, so the
+    /// side the move is heading for (our ask when Binance rises, our bid when
+    /// it falls) would be filled at a stale price. Step that side back for
+    /// `jump_hold_secs`.
+    fn watch_for_jumps(&mut self, mid: Decimal, at: Instant) {
+        let (Some(limit), Some(jump)) = (self.config.jump_bps, &mut self.jump) else {
+            return;
+        };
+        jump.on_price(mid, at);
+        if let Some(moved) = jump.move_bps()
+            && moved.abs() >= limit
+        {
+            let side = if moved > Decimal::ZERO {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
+            let until = at + Duration::from_secs(self.config.jump_hold_secs);
+            self.jump_side = Some((side, until));
+        }
     }
 
     /// The spread to quote: `spread_bps`, or wider if the market is jumpy.
@@ -1689,6 +1731,61 @@ mod tests {
             Decimal::ZERO,
             "too messy"
         );
+    }
+
+    /// Binance at 100 for two seconds, then at `to` half a second later;
+    /// the quotes `after` that, with or without the jump setting.
+    fn quotes_after_jump(jump: Option<&str>, to: &str, after: Duration) -> Quotes {
+        let (mut mm, now) = warmed_up();
+        mm.config.jump_bps = jump.map(d);
+        mm.config.jump_widen_bps = d("5");
+        mm.config.jump_hold_secs = 10;
+        mm.jump = mm
+            .config
+            .jump_bps
+            .map(|_| Momentum::new(Duration::from_millis(2000)));
+        // Two seconds of Binance at 100 first: the tracker needs that much history.
+        for ms in [2000, 1500, 1000, 500, 0] {
+            binance(&mut mm, "99.9", "100.1", now - Duration::from_millis(ms));
+        }
+        let jumped = now + Duration::from_millis(500);
+        let ask = (d(to) + d("0.1")).to_string();
+        let bid = (d(to) - d("0.1")).to_string();
+        binance(&mut mm, &bid, &ask, jumped);
+        // Binance stays there, so only the jump setting differs.
+        let later = jumped + after;
+        binance(&mut mm, &bid, &ask, later);
+        mm.wanted_quotes(later).0
+    }
+
+    #[test]
+    fn after_a_binance_jump_the_side_it_heads_for_steps_back() {
+        // Up 5 bps (limit 3): our ask, which the move is heading for, goes 5 bps further out.
+        let soon = Duration::from_secs(1);
+        let normal = quotes_after_jump(None, "100.05", soon);
+        let stepped = quotes_after_jump(Some("3"), "100.05", soon);
+        assert_eq!(stepped.bid, normal.bid, "the bid is not at risk");
+        let gap = stepped.ask.unwrap() - normal.ask.unwrap();
+        assert!(
+            gap >= d("0.04") && gap <= d("0.06"),
+            "about 5 bps further: {gap}"
+        );
+        // Ten seconds later it is back to normal.
+        let late = Duration::from_secs(11);
+        assert_eq!(
+            quotes_after_jump(Some("3"), "100.05", late),
+            quotes_after_jump(None, "100.05", late)
+        );
+        // A 2 bps move doesn't trigger it.
+        assert_eq!(
+            quotes_after_jump(Some("3"), "100.02", soon),
+            quotes_after_jump(None, "100.02", soon)
+        );
+        // Down 5 bps: now the bid steps back instead.
+        let down = quotes_after_jump(Some("3"), "99.95", soon);
+        let plain = quotes_after_jump(None, "99.95", soon);
+        assert_eq!(down.ask, plain.ask);
+        assert!(plain.bid.unwrap() - down.bid.unwrap() >= d("0.04"));
     }
 
     #[test]
